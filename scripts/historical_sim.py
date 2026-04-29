@@ -167,9 +167,7 @@ SEC_PER_HR = 3600.0
 
 
 # Direct re-exports of the math primitives (used inside this script).
-taylor4_exp            = a51.taylor4_exp
-_backlog_per_block     = a51.backlog_per_block
-_exponent_contribution = a51.exponent_contribution
+taylor4_exp = a51.taylor4_exp
 
 
 def _block_seconds(blocks: pl.DataFrame) -> np.ndarray:
@@ -180,29 +178,54 @@ def _block_seconds(blocks: pl.DataFrame) -> np.ndarray:
 def price_arbos51_per_block(blocks: pl.DataFrame) -> np.ndarray:
     """ArbOS 51 per-block price honoring the Dia activation boundary —
     pre-Dia (single T = 7 Mgas/s, A = 102 s, p_min = 0.01 gwei) for blocks
-    before 2026-01-08 17:00 UTC; Dia ladder + 0.02 gwei after."""
-    return Arbos51GasPricing.historical_price_per_block(
+    before 2026-01-08 17:00 UTC; Dia ladder + 0.02 gwei after.
+
+    Internally per-second; gathered to per-block via the block's
+    wall-clock second index.
+    """
+    block_secs = _block_seconds(blocks)
+    secs, p_per_sec = Arbos51GasPricing.historical_price_per_second(
         blocks["total_l2_gas"].to_numpy(),
-        _block_seconds(blocks),
+        block_secs,
     )
+    sec_idx = (block_secs - secs[0]).astype(np.int64)
+    return p_per_sec[sec_idx]
 
 
 def price_arbos60_per_resource(
     blocks: pl.DataFrame,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
-    parts  = a60.per_block_resource_gas(blocks)
-    bs     = _block_seconds(blocks)
-    prices, e_per_set = a60.price_per_resource(parts, bs)
-    return prices, parts, e_per_set
+    """Per-block ArbOS 60 prices (gathered from per-second internals)."""
+    parts = a60.per_block_resource_gas(blocks)
+    bs    = _block_seconds(blocks)
+    secs, prices_per_sec, e_per_set = a60.price_per_resource(parts, bs)
+    sec_idx = (bs - secs[0]).astype(np.int64)
+    prices_pb = {k: prices_per_sec[k][sec_idx] for k in a60.PRICED_SYMBOLS}
+    return prices_pb, parts, e_per_set
+
+
+def _backlog_per_block_for_set(
+    inflow_pb: np.ndarray, block_seconds: np.ndarray, T_arr: np.ndarray,
+) -> np.ndarray:
+    """Per-block backlog gather: aggregate per-block inflow to per-second,
+    run the 1-s recursion, gather back via the block's wall-clock-second
+    index. Used for the diagnostic backlog panels."""
+    secs, inflow_ps = a60.aggregate_per_second(inflow_pb, block_seconds)
+    B               = a60.backlog_per_second(inflow_ps, T_arr)        # (n_T, n_sec)
+    sec_idx         = (block_seconds - secs[0]).astype(np.int64)
+    return B[:, sec_idx]
 
 
 def compute_arbos51_backlogs(
     blocks: pl.DataFrame,
 ) -> dict[tuple[float, float], np.ndarray]:
-    return a51.backlogs_all_constraints(
+    block_secs = _block_seconds(blocks)
+    T_arr = np.array([T for T, _ in a51.ladder], dtype=np.float64)
+    B = _backlog_per_block_for_set(
         blocks["total_l2_gas"].to_numpy().astype(np.float64),
-        _block_seconds(blocks),
+        block_secs, T_arr,
     )
+    return {(T, A): B[i] for i, (T, A) in enumerate(a51.ladder)}
 
 
 def compute_backlogs(
@@ -210,7 +233,16 @@ def compute_backlogs(
 ) -> dict[str, dict[tuple[float, float], np.ndarray]]:
     parts = a60.per_block_resource_gas(blocks)
     bs    = _block_seconds(blocks)
-    return a60.backlogs_all_constraints(parts, bs)
+    out: dict[str, dict[tuple[float, float], np.ndarray]] = {}
+    for set_name, weights in a60.set_weights.items():
+        inflow_pb = np.zeros(blocks.height, dtype=np.float64)
+        for sym, w in weights.items():
+            inflow_pb = inflow_pb + w * parts[sym]
+        ladder = a60.set_ladders[set_name]
+        T_arr  = np.array([T for T, _ in ladder], dtype=np.float64)
+        B = _backlog_per_block_for_set(inflow_pb, bs, T_arr)
+        out[set_name] = {(T, A): B[i] for i, (T, A) in enumerate(ladder)}
+    return out
 
 
 
