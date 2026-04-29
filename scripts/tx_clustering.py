@@ -61,9 +61,9 @@ from sklearn.mixture import GaussianMixture
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 _HERE = pathlib.Path(__file__).resolve().parent
-DATA       = _HERE.parent / "data" / "multigas_usage_extracts" / "2026-01" / "per_tx.parquet"
+MULTIGAS_DIR   = _HERE.parent / "data" / "multigas_usage_extracts"
 BLOCKS_PARQUET = _HERE.parent / "data" / "onchain_blocks_transactions" / "per_block.parquet"
-OUT_HTML = _HERE.parent / "figures" / "clustering.html"
+OUT_HTML       = _HERE.parent / "figures" / "clustering.html"
 
 # ── Hyperparameters ─────────────────────────────────────────────────────────
 K_RANGE        = list(range(2, 9))   # 2..8
@@ -81,9 +81,9 @@ HDB_MIN_CLUSTER = 200                # ~1.3% of 15K — smallest meaningful clus
 # counts are inferred at runtime from the parquet metadata.
 TOTAL_TX_ROWS_DEFAULT = 100_000_000
 
-WEIGHT_COLS = ["w_c", "w_sw", "w_sr", "w_sg", "w_hg", "w_l2"]
-CLR_COLS    = ["x_c", "x_sw", "x_sr", "x_sg", "x_hg", "x_l2"]
-LOG_COLS    = ["l_c", "l_sw", "l_sr", "l_sg", "l_hg", "l_l2"]
+WEIGHT_COLS = ["w_c", "w_sw", "w_sr", "w_sg", "w_hg", "w_l2", "w_l1"]
+CLR_COLS    = ["x_c", "x_sw", "x_sr", "x_sg", "x_hg", "x_l2", "x_l1"]
+LOG_COLS    = ["l_c", "l_sw", "l_sr", "l_sg", "l_hg", "l_l2", "l_l1"]
 RESOURCE_LABELS = {
     "w_c":  "Computation",
     "w_sw": "Storage Write",
@@ -91,6 +91,7 @@ RESOURCE_LABELS = {
     "w_sg": "Storage Growth",
     "w_hg": "History Growth",
     "w_l2": "L2 Calldata",
+    "w_l1": "L1 Calldata",
 }
 RESOURCE_COLORS = {
     "Computation":     "#1f77b4",
@@ -99,6 +100,7 @@ RESOURCE_COLORS = {
     "Storage Growth":  "#d62728",
     "History Growth":  "#ff7f0e",
     "L2 Calldata":     "#9467bd",
+    "L1 Calldata":     "#e377c2",
 }
 ALGO_COLORS = {
     "kmeans":    "#1f77b4",
@@ -157,7 +159,8 @@ def _featurize_chunk(
     g_sg  = chunk["storageGrowth"].astype(np.float64)
     g_hg  = chunk["historyGrowth"].astype(np.float64)
     g_l2  = chunk["l2Calldata"].astype(np.float64)
-    total = g_c + g_sw + g_sr + g_sg + g_hg + g_l2
+    g_l1  = chunk["l1Calldata"].astype(np.float64)
+    total = g_c + g_sw + g_sr + g_sg + g_hg + g_l2 + g_l1
     keep  = total >= MIN_PRICED_GAS
     if not keep.any():
         empty = pd.DataFrame()
@@ -168,6 +171,7 @@ def _featurize_chunk(
     G = np.column_stack([
         g_c[keep].to_numpy(), g_sw[keep].to_numpy(), g_sr[keep].to_numpy(),
         g_sg[keep].to_numpy(), g_hg[keep].to_numpy(), g_l2[keep].to_numpy(),
+        g_l1[keep].to_numpy(),
     ])
     W = G * inv_t[:, None]
     X_clr = _clr_transform(W)
@@ -186,12 +190,13 @@ def _featurize_chunk(
 
 
 # ── Streaming I/O ───────────────────────────────────────────────────────────
-def _iter_chunks(path: pathlib.Path) -> Iterator[pd.DataFrame]:
-    """Yield CHUNKSIZE-row pandas frames from the per-tx parquet.
+def _per_tx_files() -> list[pathlib.Path]:
+    """All `per_tx.parquet` files under MULTIGAS_DIR — one per month."""
+    return sorted(MULTIGAS_DIR.glob("*/per_tx.parquet"))
 
-    Uses pyarrow's row-group iterator so we never materialise the full file
-    in memory; pandas conversion is per-batch.
-    """
+
+def _iter_chunks(paths: list[pathlib.Path]) -> Iterator[pd.DataFrame]:
+    """Yield CHUNKSIZE-row pandas frames from each per-tx parquet in turn."""
     import pyarrow.parquet as pq
 
     cols = [
@@ -199,22 +204,23 @@ def _iter_chunks(path: pathlib.Path) -> Iterator[pd.DataFrame]:
         "computation", "wasmComputation",
         "historyGrowth",
         "storageAccessRead", "storageAccessWrite",
-        "storageGrowth", "l2Calldata",
+        "storageGrowth", "l2Calldata", "l1Calldata",
     ]
-    pf = pq.ParquetFile(str(path))
-    for batch in pf.iter_batches(batch_size=CHUNKSIZE, columns=cols):
-        yield batch.to_pandas()
+    for path in paths:
+        pf = pq.ParquetFile(str(path))
+        for batch in pf.iter_batches(batch_size=CHUNKSIZE, columns=cols):
+            yield batch.to_pandas()
 
 
-def _total_rows(path: pathlib.Path) -> int:
-    """Cheap row-count from parquet metadata — used for reservoir sizing."""
+def _total_rows(paths: list[pathlib.Path]) -> int:
+    """Cheap row-count summed across every parquet — for reservoir sizing."""
     import pyarrow.parquet as pq
-    return pq.ParquetFile(str(path)).metadata.num_rows
+    return sum(pq.ParquetFile(str(p)).metadata.num_rows for p in paths)
 
 
 # ── Main streaming pass ─────────────────────────────────────────────────────
 def stream_fit_and_sample(
-    path: pathlib.Path,
+    paths: list[pathlib.Path],
     rng: np.random.Generator,
 ) -> tuple[
     pd.DataFrame,
@@ -248,7 +254,7 @@ def stream_fit_and_sample(
         for K in K_RANGE
     }
 
-    total_rows = _total_rows(path) or TOTAL_TX_ROWS_DEFAULT
+    total_rows = _total_rows(paths) or TOTAL_TX_ROWS_DEFAULT
     keep_frac = min(1.0, (N_SAMPLE * 1.4) / max(total_rows, 1))
     sample_parts: list[pd.DataFrame] = []
     n_priced = 0
@@ -256,7 +262,7 @@ def stream_fit_and_sample(
     log_mean = log_std = None
     t0 = time.time()
 
-    for i, chunk in enumerate(_iter_chunks(path)):
+    for i, chunk in enumerate(_iter_chunks(paths)):
         # Bootstrap log scaling stats from the first chunk only. Use the
         # un-standardized log values to derive mean/std, then re-featurize
         # the chunk with the stats applied so it matches all subsequent
@@ -997,10 +1003,15 @@ def main():
     args = parse_args()
     rng = np.random.default_rng(RNG_SEED)
 
-    print(f"streaming {DATA.name} → 14× MiniBatchKMeans + reservoir sample...")
+    paths = _per_tx_files()
+    if not paths:
+        raise SystemExit(f"No per_tx parquets found under {MULTIGAS_DIR}")
+    print(f"streaming {len(paths)} per_tx parquet(s) "
+          f"({', '.join(p.parent.name for p in paths)}) → "
+          f"14× MiniBatchKMeans + reservoir sample...")
     t_stream = time.time()
     sample, mbk_clr, mbk_log, n_priced, log_mean, log_std = stream_fit_and_sample(
-        DATA, rng,
+        paths, rng,
     )
     print(f"  streaming pass: {time.time() - t_stream:.1f}s, "
           f"{n_priced:,} priced txs, sample {len(sample):,}")
