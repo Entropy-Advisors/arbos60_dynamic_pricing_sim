@@ -95,7 +95,7 @@ $$
 $$
 E_i \;=\; \sum_j \frac{B_{i,j}}{A_{i,j}\,T_{i,j}},
 \qquad
-p_k \;=\; p_{\min}\,\exp\!\left(\max_i\left\{\,a_{i,k}\,E_i\right\}\right).
+p_k \;=\; p_{\min}\,\exp\!\left(\max_i\,\{a_{i,k}\,E_i\}\right).
 $$
 
 Only the **binding** set lifts $p_k$ — sets that give resource $k$ a zero
