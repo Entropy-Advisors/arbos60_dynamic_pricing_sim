@@ -33,7 +33,7 @@ equation flow:
     6. Backlog                  (backlog_per_second)
     7. Per-set raw exponent     (compute_set_exponents)
     8. Per-resource prices      (price_per_resource)
-    9. Per-tx pricing           (fee_per_tx, price_per_tx)
+    9. Per-tx pricing           (fee_per_tx)
 """
 
 from __future__ import annotations
@@ -209,9 +209,9 @@ class Arbos60GasPricing:
         history_growth: np.ndarray,
         l2_calldata: np.ndarray,
     ) -> dict[str, np.ndarray]:
-        """Build the per-tx 6-resource gas dict expected by `fee_per_tx` /
-        `price_per_tx` from raw multigas columns. l1Calldata is NOT included
-        here — ArbOS 60 prices it separately via the L1 fee mechanism."""
+        """Build the per-tx 6-resource gas dict expected by `fee_per_tx`
+        from raw multigas columns. l1Calldata is NOT included here — ArbOS
+        60 prices it separately via the L1 fee mechanism."""
         return {
             "c":  computation + wasm_computation,
             "sw": storage_access_write,
@@ -302,36 +302,21 @@ class Arbos60GasPricing:
 
         return seconds_axis, prices, E_per_set
 
-    # ── 9. Per-tx pricing (vectorised over txs) ─────────────────────────────
+    # ── 9. Per-tx fee (vectorised over txs) ─────────────────────────────────
     def fee_per_tx(
         self,
         p_per_resource: dict[str, np.ndarray],
         tx_block_idx: np.ndarray,
         tx_g_per_resource: dict[str, np.ndarray],
     ) -> np.ndarray:
-        """
-        Per-tx fee (gwei·gas) under ArbOS 60 per-resource pricing:
+        """Per-tx fee (gwei·gas) under ArbOS 60 per-resource pricing:
             fee_tx = Σ_k g_tx,k · p_k(block_of_tx)
-        """
+
+        No separate per-gas `price_per_tx`: under ArbOS 60 each resource has
+        its own price, so the natural object is the inner product above."""
         n_tx = tx_block_idx.shape[0]
         fee = np.zeros(n_tx, dtype=np.float64)
         for k in self.PRICED_SYMBOLS:
             fee = fee + tx_g_per_resource[k] * p_per_resource[k][tx_block_idx]
         return fee
-
-    def price_per_tx(
-        self,
-        p_per_resource: dict[str, np.ndarray],
-        tx_block_idx: np.ndarray,
-        tx_g_per_resource: dict[str, np.ndarray],
-    ) -> np.ndarray:
-        """
-        Per-tx price under ArbOS 60 — inner product:
-            p_tx = Σ_k g_tx,k · p_k(block_of_tx)
-
-        Dimensionally a fee (gwei·gas), not a per-gas price. Identical to
-        `fee_per_tx`; kept as a separate name for callers that speak in
-        "p_tx" terms.
-        """
-        return self.fee_per_tx(p_per_resource, tx_block_idx, tx_g_per_resource)
 
