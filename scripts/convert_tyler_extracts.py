@@ -52,6 +52,11 @@ TARS = [
      "416593974_427315178_jan_2026_per_tx_gas_dim",
      "416593974_427315178_per_tx_multigas.csv",
      "416593974_427315178_per_tx_multigas.blocks.csv"),
+    ("2026-02",
+     "Feb 2026 TX Gas Dimensions.tar.gz",
+     "427315179_437025050_feb_2026_per_tx_gas_dim",
+     "427315179_437025050_tx.csv",
+     "427315179_437025050_tx.blocks.csv"),
 ]
 
 # Explicit tx-csv schema — avoids polars dtype-inference overhead and
