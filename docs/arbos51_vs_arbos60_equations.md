@@ -44,7 +44,7 @@ every gas unit.
 $\text{inflow}_j(s) = \sum_{\text{blocks in }s} g_{\text{total}}$:
 
 $$
-B_j(s+1) \;=\; \max\!\big(0,\; B_j(s) + \text{inflow}_j(s) - T_j \cdot 1\big).
+B_j(s+1) \;=\; \max\!\left(0,\; B_j(s) + \text{inflow}_j(s) - T_j \cdot 1\right).
 $$
 
 Per-block backlog is the **start-of-second** value (i.e. $B_j$ at end of the
@@ -53,7 +53,7 @@ previous second).
 **Per-block base fee.**
 
 $$
-p_{\text{block}} \;=\; p_{\min}\,\exp\!\Big(\sum_{j=0}^{5}\frac{B_j}{A_j\,T_j}\Big).
+p_{\text{block}} \;=\; p_{\min}\,\exp\!\left(\sum_{j=0}^{5}\frac{B_j}{A_j\,T_j}\right).
 $$
 
 No upper cap on the exponent (only a floor at 0).
@@ -87,7 +87,7 @@ backlogs, and contributes a raw exponent. Resource prices are obtained by a
 **(0) Per-(set, constraint) backlog (1-second tick).**
 
 $$
-B_{i,j}(s+1) \;=\; \max\!\Big(0,\; B_{i,j}(s) + \sum_k a_{i,k}\,g_k(s) - T_{i,j}\cdot 1\Big).
+B_{i,j}(s+1) \;=\; \max\!\left(0,\; B_{i,j}(s) + \sum_k a_{i,k}\,g_k(s) - T_{i,j}\cdot 1\right).
 $$
 
 **(1) Per-set raw exponent and per-resource price.**
@@ -95,7 +95,7 @@ $$
 $$
 E_i \;=\; \sum_j \frac{B_{i,j}}{A_{i,j}\,T_{i,j}},
 \qquad
-p_k \;=\; p_{\min}\,\exp\!\Big(\max_i\big\{\,a_{i,k}\,E_i\big\}\Big).
+p_k \;=\; p_{\min}\,\exp\!\left(\max_i\left\{\,a_{i,k}\,E_i\right\}\right).
 $$
 
 Only the **binding** set lifts $p_k$ — sets that give resource $k$ a zero
