@@ -62,7 +62,7 @@ from sklearn.mixture import GaussianMixture
 # ── Paths ───────────────────────────────────────────────────────────────────
 _HERE = pathlib.Path(__file__).resolve().parent
 DATA       = _HERE.parent / "data" / "multigas_usage_extracts" / "2026-01" / "per_tx.parquet"
-BLOCKS_CSV = _HERE.parent / "data" / "onchain_blocks_transactions" / "per_block.csv"
+BLOCKS_PARQUET = _HERE.parent / "data" / "onchain_blocks_transactions" / "per_block.parquet"
 OUT_HTML = _HERE.parent / "figures" / "clustering.html"
 
 # ── Hyperparameters ─────────────────────────────────────────────────────────
@@ -489,7 +489,7 @@ def compute_cluster_timeseries(
     [cluster, hour, share_c, share_sw, share_sr, share_sg, share_hg, share_l2]
     with the 6 share columns summing to 1 per row.
     """
-    bt = pd.read_csv(BLOCKS_CSV, usecols=["block_number", "block_time"])
+    bt = pd.read_parquet(BLOCKS_PARQUET, columns=["block_number", "block_time"])
     bt["block_time"] = pd.to_datetime(bt["block_time"])
     bt["hour"] = bt["block_time"].dt.floor("h")
 

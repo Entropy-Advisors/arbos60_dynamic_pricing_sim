@@ -53,15 +53,14 @@ def _hours_x(df: pl.DataFrame, col: str = "hour") -> list:
 
 
 # ── Data loading ────────────────────────────────────────────────────────────
-# Per-tx multigas parquet (Tyler's Jan 2026 extract, post-conversion).
+# Per-tx multigas parquets — one per month under multigas_usage_extracts/.
+# scan_parquet accepts the glob, treating all months as one lazy frame.
 _DATA_ROOT = pathlib.Path(__file__).resolve().parent.parent / "data"
-MULTIGAS_TX_PQ = _DATA_ROOT / "multigas_usage_extracts" / "2026-01" / "per_tx.parquet"
-# Per-block resource sums derived once from the per-tx parquet, cached
-# next to its source month.
-PER_BLOCK_RES_PQ = (
-    _DATA_ROOT / "multigas_usage_extracts" / "2026-01" / "per_block_resources.parquet"
-)
-_DEFAULT_START = "2026-01-18"   # first day of full coverage in the revenue CSV
+MULTIGAS_TX_GLOB = str(_DATA_ROOT / "multigas_usage_extracts" / "*" / "per_tx.parquet")
+# Per-block resource sums derived once from every monthly parquet, cached
+# at the data-root level so the cache spans the full multigas window.
+PER_BLOCK_RES_PQ = _DATA_ROOT / "per_block_resources.parquet"
+_DEFAULT_START = "2025-10-01"   # first day of multigas extract coverage
 
 # Resource columns aggregated from per-tx → per-block. l1Calldata is included
 # for total-gas accounting but not priced under ArbOS 60.
@@ -74,7 +73,7 @@ _RESOURCE_COLS = [
 
 
 def load_per_block(path: str) -> pl.DataFrame:
-    df = pl.read_csv(path, try_parse_dates=True)
+    df = pl.read_parquet(path)
     if df["block_time"].dtype.base_type() == pl.Datetime and \
        getattr(df["block_time"].dtype, "time_zone", None):
         df = df.with_columns(pl.col("block_time").dt.replace_time_zone(None))
@@ -84,17 +83,18 @@ def load_per_block(path: str) -> pl.DataFrame:
 
 
 def build_per_block_resources(
-    per_tx_pq: pathlib.Path = MULTIGAS_TX_PQ,
+    per_tx_glob: str = MULTIGAS_TX_GLOB,
     cache: pathlib.Path = PER_BLOCK_RES_PQ,
     force: bool = False,
 ) -> pl.DataFrame:
-    """Sum per-tx multigas columns into per-block totals. Cached as parquet —
-    one streaming-engine groupby pass over the full per-tx parquet."""
+    """Sum per-tx multigas columns into per-block totals across every monthly
+    parquet matching `per_tx_glob`. Cached as a single zstd parquet — one
+    streaming-engine groupby pass."""
     if cache.exists() and not force:
         return pl.read_parquet(cache)
-    print(f"  building per-block resources cache from {per_tx_pq.name} ...")
+    print(f"  building per-block resources cache from {per_tx_glob} ...")
     res = (
-        pl.scan_parquet(str(per_tx_pq))
+        pl.scan_parquet(per_tx_glob)
           .select(["block"] + _RESOURCE_COLS)
           .group_by("block")
           .agg([pl.col(c).sum() for c in _RESOURCE_COLS])
@@ -119,10 +119,14 @@ def merge_blocks_with_resources(
         pl.col("block_time").dt.truncate("1h").alias("hour"),
         pl.col("block_date").cast(pl.Utf8).alias("day_str"),
     ])
+    # Inner-join: only blocks that have multigas data (i.e. that fall inside
+    # the Tyler-extract coverage window) get priced. Blocks past the latest
+    # available month — e.g. Feb-onwards on-chain data with no multigas yet —
+    # drop out cleanly until a new monthly extract is converted.
     merged = blocks.join(
         per_block_res.rename({"block": "block_number"}),
-        on="block_number", how="left",
-    ).with_columns([pl.col(c).fill_null(0).alias(c) for c in _RESOURCE_COLS])
+        on="block_number", how="inner",
+    )
     return merged
 
 # ── Re-exports from the pricing-engine classes ──────────────────────────────
@@ -174,7 +178,10 @@ def _block_seconds(blocks: pl.DataFrame) -> np.ndarray:
 
 
 def price_arbos51_per_block(blocks: pl.DataFrame) -> np.ndarray:
-    return a51.price_per_block(
+    """ArbOS 51 per-block price honoring the Dia activation boundary —
+    pre-Dia (single T = 7 Mgas/s, A = 102 s, p_min = 0.01 gwei) for blocks
+    before 2026-01-08 17:00 UTC; Dia ladder + 0.02 gwei after."""
+    return Arbos51GasPricing.historical_price_per_block(
         blocks["total_l2_gas"].to_numpy(),
         _block_seconds(blocks),
     )
@@ -368,7 +375,7 @@ def aggregate_per_tx_hourly(
     )
 
     df = (
-        pl.scan_parquet(str(MULTIGAS_TX_PQ))
+        pl.scan_parquet(MULTIGAS_TX_GLOB)
           .select([
               "block",
               "computation", "wasmComputation",
@@ -1058,12 +1065,12 @@ def main():
     # All inputs are local: per-block fees (from sql/arbitrum_revenue_per_block.sql,
     # cached by scripts/fetch_data.py) + per-tx multigas (Tyler's Jan 2026
     # extract, converted to parquet by scripts/convert_tyler_extracts.py).
-    blocks_csv = _DATA_ROOT / "onchain_blocks_transactions" / "per_block.csv"
+    blocks_pq = _DATA_ROOT / "onchain_blocks_transactions" / "per_block.parquet"
 
-    print(f"Loading blocks: {blocks_csv}")
+    print(f"Loading blocks: {blocks_pq}")
     print(f"Loading per-block resources (cached): {PER_BLOCK_RES_PQ}")
     per_block_res = build_per_block_resources()
-    blocks = merge_blocks_with_resources(load_per_block(str(blocks_csv)), per_block_res)
+    blocks = merge_blocks_with_resources(load_per_block(str(blocks_pq)), per_block_res)
     print(f"  {blocks.height:,} blocks")
 
     print("Building chart...")
