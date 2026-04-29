@@ -2,22 +2,15 @@
 Multi-panel chart comparing L2 gas consumption to ArbOS 60 constraint
 targets and simulating the resulting base fee against the ArbOS 51 baseline.
 
-Panels:
-    1       stacked bars of hourly L2 gas per priced ResourceKind
-            (Computation = computation + wasmComputation; L1Calldata excluded)
-    2–5     one per constraint set — hourly weighted inflow vs ladder targets
-    6       hourly mean gas price: observed on-chain vs simulated ArbOS 51
-            vs simulated ArbOS 60 (log-y)
-
-`storageAccess` is not split into read/write in the source data, so we apply
-a fixed R:W ratio (tuneable via R_OVER_W_RATIO) when computing per-set inflows.
+Source: Tyler's Jan 2026 per-tx multigas parquet
+(`data/multigas_usage_extracts/2026-01/per_tx.parquet`), which has the
+Storage Access read/write split natively — no R:W ratio assumed anywhere.
 
 Run:
-    python report/scripts/plot_constraints_overlay.py
+    python scripts/historical_sim.py
 
 Outputs:
-    report/figures/fig_rk_gas_vs_constraints.png   (static)
-    report/figures/fig_rk_gas_vs_constraints.html  (interactive)
+    figures/historical_sim.html
 """
 
 from __future__ import annotations
@@ -27,7 +20,6 @@ import sys
 from datetime import datetime
 
 import numpy as np
-import pandas as pd
 import plotly.graph_objects as go
 import polars as pl
 from plotly.subplots import make_subplots
@@ -36,78 +28,89 @@ from plotly.subplots import make_subplots
 _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 
-import arbos51 as a51   # noqa: E402
-import arbos60 as a60   # noqa: E402
+from arbos51 import Arbos51GasPricing      # noqa: E402
+from arbos60 import Arbos60GasPricing      # noqa: E402
+
+# Default-config pricing engines; instantiated once and reused everywhere.
+a51 = Arbos51GasPricing()
+a60 = Arbos60GasPricing()
 
 
-# ── Visual style (was figures.RESOURCE_COLORS) ──────────────────────────────
+# ── Visual style ────────────────────────────────────────────────────────────
 RESOURCE_COLORS = {
     "Computation":     "#1f77b4",   # blue
-    "StorageAccess":   "#2ca02c",   # green
+    "StorageWrite":    "#2ca02c",   # green
+    "StorageRead":     "#98df8a",   # light green
     "StorageGrowth":   "#d62728",   # red
     "HistoryGrowth":   "#ff7f0e",   # orange
     "L2Calldata":      "#9467bd",   # purple
-    "WasmComputation": "#8c564b",   # brown
-    "L1Calldata":      "#e377c2",   # pink
 }
 
 
 def _hours_x(df: pl.DataFrame, col: str = "hour") -> list:
-    """Polars Datetime/string column → Python datetime list for Plotly."""
-    s = df[col]
-    if s.dtype == pl.Utf8:
-        return pd.to_datetime(s.to_list()).tolist()
-    return s.to_list()
+    """Polars Datetime column → Python datetime list for Plotly."""
+    return df[col].to_list()
 
 
-# ── Data loading (was report/data.py — inlined here) ────────────────────────
-_WEIGHT_COLS = [
-    "w_Computation",
-    "w_StorageAccess",
-    "w_StorageGrowth",
-    "w_HistoryGrowth",
-    "w_L2Calldata",
-    "w_WasmComputation",
-    "w_L1Calldata",
+# ── Data loading ────────────────────────────────────────────────────────────
+# Per-tx multigas parquet (Tyler's Jan 2026 extract, post-conversion).
+_DATA_ROOT = pathlib.Path(__file__).resolve().parent.parent / "data"
+MULTIGAS_TX_PQ = _DATA_ROOT / "multigas_usage_extracts" / "2026-01" / "per_tx.parquet"
+# Per-block resource sums derived once from the per-tx parquet, cached
+# next to its source month.
+PER_BLOCK_RES_PQ = (
+    _DATA_ROOT / "multigas_usage_extracts" / "2026-01" / "per_block_resources.parquet"
+)
+_DEFAULT_START = "2026-01-18"   # first day of full coverage in the revenue CSV
+
+# Resource columns aggregated from per-tx → per-block. l1Calldata is included
+# for total-gas accounting but not priced under ArbOS 60.
+_RESOURCE_COLS = [
+    "computation", "wasmComputation",
+    "storageAccessRead", "storageAccessWrite",
+    "storageGrowth", "historyGrowth",
+    "l2Calldata", "l1Calldata",
 ]
-_DEFAULT_START = "2026-01-18"   # first day of full Multigas coverage
-
-
-def _strip_tz(df: pl.DataFrame, col: str) -> pl.DataFrame:
-    dtype = df[col].dtype
-    if dtype.base_type() == pl.Datetime and getattr(dtype, "time_zone", None):
-        df = df.with_columns(pl.col(col).dt.replace_time_zone(None))
-    return df
 
 
 def load_per_block(path: str) -> pl.DataFrame:
     df = pl.read_csv(path, try_parse_dates=True)
-    df = _strip_tz(df, "block_time")
+    if df["block_time"].dtype.base_type() == pl.Datetime and \
+       getattr(df["block_time"].dtype, "time_zone", None):
+        df = df.with_columns(pl.col("block_time").dt.replace_time_zone(None))
     if df["block_date"].dtype.base_type() == pl.Datetime:
         df = df.with_columns(pl.col("block_date").cast(pl.Date))
     return df
 
 
-def load_per_block_weights(path: str) -> pl.DataFrame:
-    df = pl.read_csv(path)
-    return df.with_columns(pl.col("block_number").cast(pl.Int64))
+def build_per_block_resources(
+    per_tx_pq: pathlib.Path = MULTIGAS_TX_PQ,
+    cache: pathlib.Path = PER_BLOCK_RES_PQ,
+    force: bool = False,
+) -> pl.DataFrame:
+    """Sum per-tx multigas columns into per-block totals. Cached as parquet —
+    one streaming-engine groupby pass over the full per-tx parquet."""
+    if cache.exists() and not force:
+        return pl.read_parquet(cache)
+    print(f"  building per-block resources cache from {per_tx_pq.name} ...")
+    res = (
+        pl.scan_parquet(str(per_tx_pq))
+          .select(["block"] + _RESOURCE_COLS)
+          .group_by("block")
+          .agg([pl.col(c).sum() for c in _RESOURCE_COLS])
+          .sort("block")
+          .collect(engine="streaming")
+    )
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    res.write_parquet(str(cache), compression="zstd")
+    print(f"  cached {res.height:,} rows → {cache}")
+    return res
 
 
-def load_hourly_weights(path: str) -> pl.DataFrame:
-    df = pl.read_csv(path, try_parse_dates=True)
-    if df["hour"].dtype == pl.Utf8:
-        df = df.with_columns(
-            pl.col("hour").str.to_datetime(format=None, strict=False)
-        )
-    df = _strip_tz(df, "hour")
-    return df.with_columns(pl.col("hour").dt.truncate("1h"))
-
-
-def merge_blocks_with_weights(
+def merge_blocks_with_resources(
     blocks: pl.DataFrame,
-    weights: pl.DataFrame,
+    per_block_res: pl.DataFrame,
     start_date: str = _DEFAULT_START,
-    per_block_weights: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     if start_date:
         cutoff = datetime.strptime(start_date, "%Y-%m-%d").date()
@@ -116,51 +119,36 @@ def merge_blocks_with_weights(
         pl.col("block_time").dt.truncate("1h").alias("hour"),
         pl.col("block_date").cast(pl.Utf8).alias("day_str"),
     ])
-    if per_block_weights is not None:
-        available_w = [c for c in _WEIGHT_COLS if c in per_block_weights.columns]
-        merged = blocks.join(
-            per_block_weights.select(["block_number"] + available_w),
-            on="block_number", how="left",
-        )
-    else:
-        available_w = [c for c in _WEIGHT_COLS if c in weights.columns]
-        merged = blocks.join(
-            weights.select(["hour"] + available_w), on="hour", how="left",
-        )
-    merged = merged.with_columns([pl.col(c).fill_null(0.0) for c in available_w])
-    for c in _WEIGHT_COLS:
-        if c not in merged.columns:
-            merged = merged.with_columns(pl.lit(0.0).alias(c))
+    merged = blocks.join(
+        per_block_res.rename({"block": "block_number"}),
+        on="block_number", how="left",
+    ).with_columns([pl.col(c).fill_null(0).alias(c) for c in _RESOURCE_COLS])
     return merged
 
-# ── Re-export from the standalone equation modules ──────────────────────────
+# ── Re-exports from the pricing-engine classes ──────────────────────────────
 # All equation logic lives in scripts/arbos51.py and scripts/arbos60.py.
-# These thin wrappers just adapt the polars-DataFrame call signature used
-# throughout build_fig() to the numpy-array signatures of the modules.
+# These thin wrappers adapt the polars-DataFrame call signature used in
+# build_fig() to the numpy-array signatures the classes expect.
 
-P_MIN_GWEI          = a51.P_MIN_GWEI
-EXPONENT_CAP        = a51.EXPONENT_CAP
-BACKLOG_TOLERANCE_S = a51.BACKLOG_TOLERANCE_S
-R_OVER_W_RATIO      = a60.R_OVER_W_RATIO
-SA_WRITE_SHARE      = a60.SA_WRITE_SHARE
-SA_READ_SHARE       = a60.SA_READ_SHARE
-ARBOS51_LADDER      = a51.ARBOS51_LADDER
-SET_WEIGHTS         = a60.SET_WEIGHTS
-SET_LADDERS         = a60.SET_LADDERS
+P_MIN_GWEI          = a51.p_min_gwei
+ARBOS51_LADDER      = a51.ladder
+SET_WEIGHTS         = a60.set_weights
+SET_LADDERS         = a60.set_ladders
 PRICED_SYMBOLS      = a60.PRICED_SYMBOLS
 PRICED_SYMBOL_LABELS = a60.PRICED_SYMBOL_LABELS
 
 PRICED_KINDS = [
     "Computation",      # = computation + wasmComputation
-    "StorageAccess",    # combined Read + Write (not split in the source data)
+    "StorageWrite",     # storageAccessWrite
+    "StorageRead",      # storageAccessRead
     "StorageGrowth",
     "HistoryGrowth",
     "L2Calldata",
 ]
 PRICED_SYMBOL_COLORS = {
     "c":  "#1f77b4",   # Computation — blue
-    "sw": "#2ca02c",   # Storage Write — StorageAccess green
-    "sr": "#98df8a",   # Storage Read — light green companion
+    "sw": "#2ca02c",   # Storage Write — green
+    "sr": "#98df8a",   # Storage Read — light green
     "sg": "#d62728",   # Storage Growth — red
     "hg": "#ff7f0e",   # History Growth — orange
     "l2": "#9467bd",   # L2 Calldata — purple
@@ -180,41 +168,25 @@ _backlog_per_block     = a51.backlog_per_block
 _exponent_contribution = a51.exponent_contribution
 
 
-def _dt_seconds_per_block(blocks: pl.DataFrame) -> np.ndarray:
-    """Per-block integer-second deltas, derived from `block_time`."""
-    return a51.dt_seconds_per_block(blocks["block_time"].to_numpy())
+def _block_seconds(blocks: pl.DataFrame) -> np.ndarray:
+    """Per-block integer-second UTC timestamps (input to the 1s-tick model)."""
+    return a51.block_seconds_utc(blocks["block_time"].to_numpy())
 
 
-def _per_block_resource_gas(blocks: pl.DataFrame) -> dict[str, np.ndarray]:
-    """Per-block resource gas split across the 6 priced symbols."""
-    return a60.per_block_resource_gas(blocks)
-
-
-def price_arbos51_per_block(
-    blocks: pl.DataFrame, p_min_gwei: float = P_MIN_GWEI,
-) -> np.ndarray:
+def price_arbos51_per_block(blocks: pl.DataFrame) -> np.ndarray:
     return a51.price_per_block(
         blocks["total_l2_gas"].to_numpy(),
-        _dt_seconds_per_block(blocks),
-        p_min_gwei=p_min_gwei,
+        _block_seconds(blocks),
     )
 
 
 def price_arbos60_per_resource(
-    blocks: pl.DataFrame, p_min_gwei: float = P_MIN_GWEI,
+    blocks: pl.DataFrame,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
     parts  = a60.per_block_resource_gas(blocks)
-    dt_s   = _dt_seconds_per_block(blocks)
-    prices, E_per_set = a60.price_per_resource(parts, dt_s, p_min_gwei)
-    return prices, parts, E_per_set
-
-
-def arbos60_block_fee_and_gas(
-    blocks: pl.DataFrame, p_min_gwei: float = P_MIN_GWEI,
-) -> tuple[np.ndarray, np.ndarray]:
-    parts = a60.per_block_resource_gas(blocks)
-    dt_s  = _dt_seconds_per_block(blocks)
-    return a60.block_fee_and_gas(parts, dt_s, p_min_gwei)
+    bs     = _block_seconds(blocks)
+    prices, e_per_set = a60.price_per_resource(parts, bs)
+    return prices, parts, e_per_set
 
 
 def compute_arbos51_backlogs(
@@ -222,7 +194,7 @@ def compute_arbos51_backlogs(
 ) -> dict[tuple[float, float], np.ndarray]:
     return a51.backlogs_all_constraints(
         blocks["total_l2_gas"].to_numpy().astype(np.float64),
-        _dt_seconds_per_block(blocks),
+        _block_seconds(blocks),
     )
 
 
@@ -230,20 +202,20 @@ def compute_backlogs(
     blocks: pl.DataFrame,
 ) -> dict[str, dict[tuple[float, float], np.ndarray]]:
     parts = a60.per_block_resource_gas(blocks)
-    dt_s  = _dt_seconds_per_block(blocks)
-    return a60.backlogs_all_constraints(parts, dt_s)
+    bs    = _block_seconds(blocks)
+    return a60.backlogs_all_constraints(parts, bs)
 
 
 
 def hourly_gas_per_kind(blocks: pl.DataFrame) -> pl.DataFrame:
-    """Hourly raw gas (Mgas) per priced ResourceKind, keyed by `hour`."""
+    """Hourly raw gas per priced ResourceKind, keyed by `hour` (gas units)."""
     df = blocks.with_columns([
-        ((pl.col("w_Computation") + pl.col("w_WasmComputation"))
-         * pl.col("total_l2_gas")).alias("gas_Computation"),
-        (pl.col("w_StorageAccess") * pl.col("total_l2_gas")).alias("gas_StorageAccess"),
-        (pl.col("w_StorageGrowth") * pl.col("total_l2_gas")).alias("gas_StorageGrowth"),
-        (pl.col("w_HistoryGrowth") * pl.col("total_l2_gas")).alias("gas_HistoryGrowth"),
-        (pl.col("w_L2Calldata")    * pl.col("total_l2_gas")).alias("gas_L2Calldata"),
+        (pl.col("computation") + pl.col("wasmComputation")).alias("gas_Computation"),
+        pl.col("storageAccessWrite").alias("gas_StorageWrite"),
+        pl.col("storageAccessRead").alias("gas_StorageRead"),
+        pl.col("storageGrowth").alias("gas_StorageGrowth"),
+        pl.col("historyGrowth").alias("gas_HistoryGrowth"),
+        pl.col("l2Calldata").alias("gas_L2Calldata"),
     ])
     return (
         df.group_by("hour")
@@ -255,22 +227,11 @@ def hourly_gas_per_kind(blocks: pl.DataFrame) -> pl.DataFrame:
 def weighted_inflow_mgas_hr(
     rk_hr: pl.DataFrame, weights: dict[str, float],
 ) -> np.ndarray:
-    """
-    Compute hourly weighted inflow Σ_k w_k · g_k in Mgas/hour.
-
-    Symbol map:
-        c  → gas_Computation
-        sw → gas_StorageAccess × write_share
-        sr → gas_StorageAccess × read_share
-        sg → gas_StorageGrowth
-        hg → gas_HistoryGrowth
-        l2 → gas_L2Calldata
-    """
-    sa = rk_hr["gas_StorageAccess"].to_numpy()
+    """Hourly weighted inflow Σ_k w_k · g_k in Mgas/hour."""
     parts = {
         "c":  rk_hr["gas_Computation"].to_numpy(),
-        "sw": sa * SA_WRITE_SHARE,
-        "sr": sa * SA_READ_SHARE,
+        "sw": rk_hr["gas_StorageWrite"].to_numpy(),
+        "sr": rk_hr["gas_StorageRead"].to_numpy(),
         "sg": rk_hr["gas_StorageGrowth"].to_numpy(),
         "hg": rk_hr["gas_HistoryGrowth"].to_numpy(),
         "l2": rk_hr["gas_L2Calldata"].to_numpy(),
@@ -354,6 +315,120 @@ def _arbos60_inequalities_latex() -> str:
     return r" \\[2pt] ".join(lines)
 
 
+# ── Per-tx hourly price aggregation (single lazy polars pipeline) ────────────
+def aggregate_per_tx_hourly(
+    blocks: pl.DataFrame,
+    p51_pb: np.ndarray,
+    p60_prices: dict[str, np.ndarray],
+) -> pl.DataFrame:
+    """
+    Compute hourly gas-weighted prices and revenues by streaming the per-tx
+    parquet through one lazy polars pipeline:
+
+        fee_real_tx = real_block_price · g_tx_total
+        fee_51_tx   = p51_block         · g_tx_total
+        fee_60_tx   = Σ_k g_tx,k · p_k(block)
+        p̄_hr       = Σ_tx fee_tx / Σ_tx gas_tx                 (per channel)
+
+    Mathematically equivalent to the block-level fee-sum / gas-sum
+    aggregation when prices are uniform within a block (always true for
+    ArbOS 51 and 60). Stated explicitly here so the per-tx model is plain
+    in code. ArbOS 60 denominator uses *priced* gas (excludes l1Calldata).
+    """
+    import time as _time
+
+    # Per-block keyed prices, broadcast to per-tx via a lazy join.
+    prices_pb = pl.DataFrame({
+        "block":  blocks["block_number"].cast(pl.Int64),
+        "hour":   blocks["hour"],
+        "p_real": blocks["avg_eff_price_gwei"].fill_null(0.0).cast(pl.Float64),
+        "p51":    pl.Series("p51", p51_pb, dtype=pl.Float64),
+        "p_c":    pl.Series("p_c",  p60_prices["c"],  dtype=pl.Float64),
+        "p_sw":   pl.Series("p_sw", p60_prices["sw"], dtype=pl.Float64),
+        "p_sr":   pl.Series("p_sr", p60_prices["sr"], dtype=pl.Float64),
+        "p_sg":   pl.Series("p_sg", p60_prices["sg"], dtype=pl.Float64),
+        "p_hg":   pl.Series("p_hg", p60_prices["hg"], dtype=pl.Float64),
+        "p_l2":   pl.Series("p_l2", p60_prices["l2"], dtype=pl.Float64),
+    })
+
+    print("  streaming per-tx parquet → hourly fees / gas / fee_k (lazy polars)...")
+    t0 = _time.time()
+
+    g_priced_expr = (
+        pl.col("g_c") + pl.col("g_sw") + pl.col("g_sr")
+        + pl.col("g_sg") + pl.col("g_hg") + pl.col("g_l2")
+    )
+    fee_p60_expr = (
+        pl.col("g_c")  * pl.col("p_c")
+        + pl.col("g_sw") * pl.col("p_sw")
+        + pl.col("g_sr") * pl.col("p_sr")
+        + pl.col("g_sg") * pl.col("p_sg")
+        + pl.col("g_hg") * pl.col("p_hg")
+        + pl.col("g_l2") * pl.col("p_l2")
+    )
+
+    df = (
+        pl.scan_parquet(str(MULTIGAS_TX_PQ))
+          .select([
+              "block",
+              "computation", "wasmComputation",
+              "storageAccessRead", "storageAccessWrite",
+              "storageGrowth", "historyGrowth",
+              "l1Calldata", "l2Calldata",
+          ])
+          # Inner-join trims rows for blocks outside the revenue-CSV window.
+          .join(prices_pb.lazy(), on="block", how="inner")
+          .with_columns([
+              (pl.col("computation") + pl.col("wasmComputation")).cast(pl.Float64).alias("g_c"),
+              pl.col("storageAccessWrite").cast(pl.Float64).alias("g_sw"),
+              pl.col("storageAccessRead").cast(pl.Float64).alias("g_sr"),
+              pl.col("storageGrowth").cast(pl.Float64).alias("g_sg"),
+              pl.col("historyGrowth").cast(pl.Float64).alias("g_hg"),
+              pl.col("l2Calldata").cast(pl.Float64).alias("g_l2"),
+              pl.col("l1Calldata").cast(pl.Float64).alias("g_l1"),
+          ])
+          .with_columns([
+              g_priced_expr.alias("priced_gas"),
+              (g_priced_expr + pl.col("g_l1")).alias("total_gas"),
+              fee_p60_expr.alias("p60_fee"),
+          ])
+          .with_columns([
+              (pl.col("p_real") * pl.col("total_gas")).alias("real_fee"),
+              (pl.col("p51")    * pl.col("total_gas")).alias("p51_fee"),
+              # Per-resource fee_k = g_tx,k · p_k(block) — used for the
+              # hourly per-resource price panel.
+              (pl.col("g_c")  * pl.col("p_c")).alias("fee_c"),
+              (pl.col("g_sw") * pl.col("p_sw")).alias("fee_sw"),
+              (pl.col("g_sr") * pl.col("p_sr")).alias("fee_sr"),
+              (pl.col("g_sg") * pl.col("p_sg")).alias("fee_sg"),
+              (pl.col("g_hg") * pl.col("p_hg")).alias("fee_hg"),
+              (pl.col("g_l2") * pl.col("p_l2")).alias("fee_l2"),
+          ])
+          .group_by("hour")
+          .agg([
+              pl.col("real_fee").sum().alias("_real_fee"),
+              pl.col("p51_fee").sum().alias("_p51_fee"),
+              pl.col("p60_fee").sum().alias("_p60_fee"),
+              pl.col("total_gas").sum().alias("_total_gas"),
+              pl.col("priced_gas").sum().alias("_priced_gas"),
+              *[pl.col(f"fee_{k}").sum().alias(f"_fee_{k}") for k in PRICED_SYMBOLS],
+              *[pl.col(f"g_{k}").sum().alias(f"_gas_{k}")  for k in PRICED_SYMBOLS],
+          ])
+          .sort("hour")
+          .collect(engine="streaming")
+    )
+    print(f"    done in {_time.time() - t0:.1f}s, {df.height:,} hourly rows")
+
+    df = df.with_columns([
+        (pl.col("_real_fee") / pl.col("_total_gas")).alias("p_real_gwei"),
+        (pl.col("_p51_fee")  / pl.col("_total_gas")).alias("p51_gwei"),
+        (pl.col("_p60_fee")  / pl.col("_priced_gas")).alias("p60_gwei"),
+        *[(pl.col(f"_fee_{k}") / pl.col(f"_gas_{k}")).alias(f"p_{k}_gwei")
+          for k in PRICED_SYMBOLS],
+    ])
+    return df
+
+
 def build_fig(blocks: pl.DataFrame) -> go.Figure:
     rk_hr = hourly_gas_per_kind(blocks)
     x = _hours_x(rk_hr)
@@ -366,72 +441,30 @@ def build_fig(blocks: pl.DataFrame) -> go.Figure:
     # hour Σ fee_tx / Σ gas_tx. Since all txs in a block share the same p_k
     # vector, this reduces per-block to (Σ_k p_k·G_k) / (Σ_k G_k) and at the
     # hourly level to Σ_block fee_block / Σ_block gas_block.
-    print("  simulating ArbOS 51 prices...")
+    print("  simulating ArbOS 51 prices (per-block, applied to every tx)...")
     p51_pb = price_arbos51_per_block(blocks)
     print("  simulating ArbOS 60 prices (per-resource max-over-sets)...")
-    p60_prices, p60_parts, _ = price_arbos60_per_resource(blocks)
-    p60_fee_pb, p60_gas_pb = arbos60_block_fee_and_gas(blocks)
+    p60_prices, _, _ = price_arbos60_per_resource(blocks)
     print("  computing per-(set, constraint) backlogs...")
     backlogs_pb = compute_backlogs(blocks)
     print("  computing ArbOS 51 backlogs...")
     arbos51_backlogs_pb = compute_arbos51_backlogs(blocks)
 
-    total_gas_pb = blocks["total_l2_gas"].to_numpy().astype(np.float64)
-    # Empty blocks have null avg_eff_price; null × 0 propagates as null and
-    # poisons the hourly sum. Fill with 0 so they contribute nothing.
-    real_pb      = (
-        blocks["avg_eff_price_gwei"].fill_null(0.0).to_numpy().astype(np.float64)
-    )
-    real_pb      = np.nan_to_num(real_pb, nan=0.0)
-
-    # Build a single dataframe carrying all per-block (fee, gas) columns
-    # we need for hourly gas-weighted means: real, ArbOS 51, ArbOS 60 total,
-    # and ArbOS 60 per-resource k.
-    cols = [
-        pl.Series("real_fee",  real_pb * total_gas_pb),
-        pl.Series("p51_fee",   p51_pb  * total_gas_pb),
-        pl.Series("total_gas", total_gas_pb),
-        pl.Series("p60_fee",   p60_fee_pb),
-        pl.Series("p60_gas",   p60_gas_pb),
-    ]
-    for k in PRICED_SYMBOLS:
-        cols.append(pl.Series(f"fee_{k}", p60_prices[k] * p60_parts[k]))
-        cols.append(pl.Series(f"gas_{k}", p60_parts[k]))
-
-    agg_exprs = [
-        pl.col("real_fee").sum().alias("real_fee_sum"),
-        pl.col("p51_fee").sum().alias("p51_fee_sum"),
-        pl.col("total_gas").sum().alias("total_gas_sum"),
-        pl.col("p60_fee").sum().alias("p60_fee_sum"),
-        pl.col("p60_gas").sum().alias("p60_gas_sum"),
-    ]
-    for k in PRICED_SYMBOLS:
-        agg_exprs.append(pl.col(f"fee_{k}").sum().alias(f"fee_{k}_sum"))
-        agg_exprs.append(pl.col(f"gas_{k}").sum().alias(f"gas_{k}_sum"))
-
-    derive_exprs = [
-        (pl.col("real_fee_sum") / pl.col("total_gas_sum")).alias("p_real_gwei"),
-        (pl.col("p51_fee_sum")  / pl.col("total_gas_sum")).alias("p51_gwei"),
-        (pl.col("p60_fee_sum")  / pl.col("p60_gas_sum")).alias("p60_gwei"),
-    ]
-    for k in PRICED_SYMBOLS:
-        derive_exprs.append(
-            (pl.col(f"fee_{k}_sum") / pl.col(f"gas_{k}_sum")).alias(f"p_{k}_gwei")
-        )
-
-    prices_hr = (
-        blocks.select(["hour"])
-              .with_columns(cols)
-              .group_by("hour")
-              .agg(agg_exprs)
-              .with_columns(derive_exprs)
-              .sort("hour")
-    )
+    # Per-tx → hourly aggregation: stream the tx-level multigas csv, compute
+    # fee_tx for each tx (real, ArbOS 51, ArbOS 60 inner-product), then
+    # Σ fee / Σ gas per hour. Vectorised end-to-end. See
+    # `aggregate_per_tx_hourly` for the full doc.
+    prices_hr = aggregate_per_tx_hourly(blocks, p51_pb, p60_prices)
     x_price  = _hours_x(prices_hr)
     p51_hr   = prices_hr["p51_gwei"].to_numpy()
     p60_hr   = prices_hr["p60_gwei"].to_numpy()
     preal_hr = prices_hr["p_real_gwei"].to_numpy()
     pk_hr    = {k: prices_hr[f"p_{k}_gwei"].to_numpy() for k in PRICED_SYMBOLS}
+
+    # Hourly revenue in ETH = Σ fee_per_tx / 1e9 (fees stored as gwei·gas).
+    rev_real_eth = prices_hr["_real_fee"].to_numpy() / 1e9
+    rev_51_eth   = prices_hr["_p51_fee"].to_numpy()  / 1e9
+    rev_60_eth   = prices_hr["_p60_fee"].to_numpy()  / 1e9
 
     # Hourly mean backlog per (set, constraint) in Mgas — uses a flat schema with
     # generated column names to round-trip through the polars groupby.
@@ -471,7 +504,10 @@ def build_fig(blocks: pl.DataFrame) -> go.Figure:
     set_names = list(SET_WEIGHTS.keys())
     # gas bars + weight bars + 4 set inflow panels + ArbOS 51 backlog panel
     # + 4 ArbOS 60 set backlog panels + per-resource p_k panel + price panel
-    n_panels = 1 + 1 + len(set_names) + 1 + len(set_names) + 1 + 1
+    # gas bars + weights bars + 4 inflow panels + ArbOS 51 backlog + 4
+    # ArbOS 60 backlog panels + per-resource p_k panel + price-compare
+    # panel + revenue-compare panel  =  14 panels.
+    n_panels = 1 + 1 + len(set_names) + 1 + len(set_names) + 1 + 1 + 1
 
     # Equal height for every subplot — Plotly normalizes these internally.
     row_heights = [1.0] * n_panels
@@ -509,6 +545,10 @@ def build_fig(blocks: pl.DataFrame) -> go.Figure:
     titles.append(
         r"$\text{Gas price --- observed on-chain vs simulated ArbOS 51 "
         r"vs simulated ArbOS 60. Hourly gas-weighted mean.}$"
+    )
+    titles.append(
+        r"$\text{Hourly L2 revenue (ETH) --- observed on-chain vs simulated "
+        r"ArbOS 51 vs simulated ArbOS 60}$"
     )
 
     fig = make_subplots(
@@ -730,7 +770,7 @@ def build_fig(blocks: pl.DataFrame) -> go.Figure:
         )
 
     # ── Penultimate panel: per-resource ArbOS 60 prices p_k ────────────────
-    pk_row = n_panels - 1
+    pk_row = n_panels - 2
     pk_max = P_MIN_GWEI
     for k in PRICED_SYMBOLS:
         y = pk_hr[k]
@@ -772,7 +812,7 @@ def build_fig(blocks: pl.DataFrame) -> go.Figure:
     )
 
     # ── Final panel: observed on-chain vs simulated ArbOS 51 / 60 ──────────
-    price_row = n_panels
+    price_row = n_panels - 1
     # Observed on-chain L2 effective gas price, plotted first so the
     # simulated lines render on top of it.
     fig.add_trace(
@@ -832,6 +872,53 @@ def build_fig(blocks: pl.DataFrame) -> go.Figure:
         row=price_row, col=1,
     )
 
+    # ── Hourly revenue (ETH) — observed vs simulated 51 / 60 ────────────────
+    revenue_row = n_panels
+    fig.add_trace(
+        go.Scatter(
+            x=x_price, y=rev_real_eth,
+            mode="lines",
+            name="Observed on-chain (ETH/hr)",
+            line=dict(color="#d62728", width=2.0),
+            hovertemplate="Observed: %{y:.4f} ETH/hr<extra></extra>",
+            legendgroup="revenue",
+            legendgrouptitle_text="Hourly L2 revenue (ETH)",
+        ),
+        row=revenue_row, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x_price, y=rev_51_eth,
+            mode="lines",
+            name="ArbOS 51 sim (ETH/hr)",
+            line=dict(color="#555", width=1.4, dash="dash"),
+            hovertemplate="ArbOS 51 sim: %{y:.4f} ETH/hr<extra></extra>",
+            legendgroup="revenue",
+        ),
+        row=revenue_row, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x_price, y=rev_60_eth,
+            mode="lines",
+            name="ArbOS 60 sim (ETH/hr)",
+            line=dict(color="#1f77b4", width=1.6),
+            hovertemplate="ArbOS 60 sim: %{y:.4f} ETH/hr<extra></extra>",
+            legendgroup="revenue",
+        ),
+        row=revenue_row, col=1,
+    )
+    rev_max = max(
+        float(np.nanmax(rev_real_eth)) if not np.all(np.isnan(rev_real_eth)) else 0.0,
+        float(np.nanmax(rev_51_eth))   if not np.all(np.isnan(rev_51_eth))   else 0.0,
+        float(np.nanmax(rev_60_eth))   if not np.all(np.isnan(rev_60_eth))   else 0.0,
+    )
+    fig.update_yaxes(
+        title_text="ETH / hr",
+        range=[0, rev_max * 1.10] if rev_max > 0 else [0, 1],
+        row=revenue_row, col=1,
+    )
+
     # ── Layout ──────────────────────────────────────────────────────────────
     panel_height_px = 400
     total_height    = panel_height_px * n_panels + 140   # + title/margin slack
@@ -842,7 +929,7 @@ def build_fig(blocks: pl.DataFrame) -> go.Figure:
                 "<b>L2 Gas vs ArbOS 60 Constraint Targets — Hourly (Jan 2026)</b>"
                 "<br>"
                 f"<sub>p<sub>min</sub> = {P_MIN_GWEI} gwei (same floor for all resources). "
-                f"Storage-access R:W split = {R_OVER_W_RATIO:.2f}:1.</sub>"
+                "Storage Read / Write taken directly from per-tx multigas.</sub>"
             ),
             x=0.0, xanchor="left",
             font=dict(size=20, color="#111"),
@@ -850,8 +937,13 @@ def build_fig(blocks: pl.DataFrame) -> go.Figure:
         template="plotly_white",
         barmode="overlay",
         hovermode="x",               # per-trace tooltips aligned on the x-axis
-        height=total_height + 1320,  # extra space reserved for the formula + table footer
-        margin=dict(l=90, r=360, t=110, b=1380),
+        # Scope tooltip to the panel under the cursor (Plotly 5.13+) — without
+        # this, hovermode="x" lumps every panel's traces at the cursor's x
+        # into one tooltip. With it, the price panel shows only 3 gwei lines
+        # and the revenue panel shows only 3 ETH/hr lines.
+        hoversubplots="single",
+        height=total_height + 1480,  # extra space reserved for the formula + table footer
+        margin=dict(l=90, r=360, t=110, b=1540),
         legend=dict(
             orientation="v",
             yanchor="top", y=1.0,
@@ -905,8 +997,26 @@ def build_fig(blocks: pl.DataFrame) -> go.Figure:
         borderpad=16,
         text=(
             r"$\begin{array}{l}"
-            + r"\textbf{ArbOS 51 --- single-dim, 6-constraint ladder (on-chain Dia):}\\[4pt]"
-            r"\quad{}\text{backlog (Lindley): }"
+            + r"\textbf{Notation (applies to both ArbOS 51 and ArbOS 60):} \\[2pt]"
+            r"\quad{}\bullet\;\;i\in\{1,2,3,4\}=\text{set index (ArbOS 60 only; ArbOS 51 has one set, index suppressed)};\;\;"
+            r"j\in\{0,..,5\}=\text{constraint index within a set};\;\;"
+            r"k=\text{resource index} \\[2pt]"
+            r"\quad{}\bullet\;\;t=\text{block timestamp in UTC seconds (one value per block)};\;\;"
+            r"\Delta t = t_N - t_{N-1}\;\text{(integer seconds — the drain step)} \\[2pt]"
+            r"\quad{}\bullet\;\;T_{i,j}=\text{target throughput / drain rate for constraint }(i,j)\;(\text{Mgas/s});\;\;"
+            r"A_{i,j}=\text{adjustment window }(\text{s}) \\[2pt]"
+            r"\quad{}\bullet\;\;B_{i,j}(t)=\text{backlog at block-time }t\text{ (accumulated gas above target, in gas units)} \\[2pt]"
+            r"\quad{}\bullet\;\;a_{i,k}=\text{weight of resource }k\text{ in set }i\text{'s weighted inequality} \\[2pt]"
+            r"\quad{}\bullet\;\;\text{Floor }p_{\min}=0.02\text{ gwei (every resource)} \\[2pt]"
+            r"\quad{}\bullet\;\;\text{Resources: }"
+            r"g_c=\text{Computation},\;"
+            r"g_{sw}=\text{Storage Write},\;"
+            r"g_{sr}=\text{Storage Read},\;"
+            r"g_{sg}=\text{Storage Growth},\;"
+            r"g_{hg}=\text{History Growth},\;"
+            r"g_{l2}=\text{L2 Calldata} \\[12pt]"
+            r"\textbf{ArbOS 51 --- single-dim, 6-constraint ladder (on-chain Dia):}\\[4pt]"
+            r"\quad{}\text{backlog: }"
             r"B_j(t{+}1) = \max\!\big(0,\,B_j(t) + g_{\text{total}}(t) - T_j\,\Delta t\big)"
             r"\\[4pt]"
             r"\quad{}\text{price: }"
@@ -924,28 +1034,17 @@ def build_fig(blocks: pl.DataFrame) -> go.Figure:
             r"5 & 60 & 9 \\ \hline"
             r"\end{array} \\[12pt]"
             r"\textbf{ArbOS 60 --- per-resource pricing (4 sets, 19 constraints):}\\[4pt]"
-            r"\quad{}\text{(0) per-(set, constraint) backlog (Lindley): }"
+            r"\quad{}\text{(0) per-(set, constraint) backlog: }"
             r"B_{i,j}(t{+}1) = \max\!\big(0,\,B_{i,j}(t) + \sum_k a_{i,k}\,g_k(t) - T_{i,j}\,\Delta t\big)"
             r"\\[6pt]"
             r"\quad{}\text{(1) per-resource price:}\quad{}p_k = p_{\min}\,\exp\!"
             r"\Big(\max_i\big\{\,a_{i,k}\sum_j \tfrac{B_{i,j}}{A_{i,j}\,T_{i,j}}\big\}\Big) \\[6pt]"
-            r"\quad{}\text{(2) per-tx price (inner product):}\quad{}"
-            r"p_{tx}=\langle\mathbf{w}_{tx},\,\mathbf{p}\rangle="
-            r"\sum_k w_{tx,k}\,p_k,\quad{}"
-            r"w_{tx,k}=\tfrac{g_{tx,k}}{\sum_k g_{tx,k}} \\[6pt]"
+            r"\quad{}\text{(2) per-tx price (unnormalized inner product):}\quad{}"
+            r"p_{tx}=\sum_k g_{tx,k}\,p_k \\[6pt]"
             r"\quad{}\text{(3) hourly avg (gas-weighted):}\quad{}"
             r"\bar p_{\text{hr}} = "
-            r"\dfrac{\sum_{tx\in\text{hr}} G_{tx}\,p_{tx}}{\sum_{tx\in\text{hr}} G_{tx}},\quad{}"
-            r"G_{tx}=\sum_k g_{tx,k} \\[6pt]"
-            r"\quad{}\text{Set }i\text{ with constraints }j;\;a_{i,k}=\text{weight of }k\text{ in set }i \\[2pt]"
-            r"\quad{}\text{Floor: }p_{\min}=0.02\text{ gwei (same for all resources)} \\[2pt]"
-            r"\quad{}\text{Resources }k:\;"
-            r"g_c=\text{Computation},\;"
-            r"g_{sw}=\text{Storage Write},\;"
-            r"g_{sr}=\text{Storage Read},\;"
-            r"g_{sg}=\text{Storage Growth},\;"
-            r"g_{hg}=\text{History Growth},\;"
-            r"g_{l2}=\text{L2 Calldata} \\[8pt]"
+            r"\dfrac{\sum_{tx\in\text{hr}} p_{tx}}{\sum_{tx\in\text{hr}} G_{tx}},\quad{}"
+            r"G_{tx}=\sum_k g_{tx,k} \\[8pt]"
             + _arbos60_inequalities_latex() + r" \\[10pt]"
             r"\quad{}" + _arbos60_tables_latex() +
             r"\end{array}$"
@@ -956,33 +1055,21 @@ def build_fig(blocks: pl.DataFrame) -> go.Figure:
 
 
 def main():
-    # Source data still lives in the original repo (see README.md). Point the
-    # paths there directly — the clean folder holds only code + HTML output.
-    src_data = pathlib.Path(
-        "/Users/mohammedbenseddik/Documents/Dev/EA/arbos60/data"
-    )
-    src_report_data = pathlib.Path(
-        "/Users/mohammedbenseddik/Documents/Dev/EA/arbos60/report/data"
-    )
-    blocks_csv    = src_data / "arbitrum_revenue_per_block.csv"
-    hourly_csv    = src_report_data / "hourly_multigas_weights_corrected.csv"
-    per_block_csv = src_report_data / "per_block_multigas_weights.csv"
+    # All inputs are local: per-block fees (from sql/arbitrum_revenue_per_block.sql,
+    # cached by scripts/fetch_data.py) + per-tx multigas (Tyler's Jan 2026
+    # extract, converted to parquet by scripts/convert_tyler_extracts.py).
+    blocks_csv = _DATA_ROOT / "onchain_blocks_transactions" / "per_block.csv"
 
     print(f"Loading blocks: {blocks_csv}")
-    per_block_weights = (
-        load_per_block_weights(str(per_block_csv)) if per_block_csv.exists() else None
-    )
-    blocks = merge_blocks_with_weights(
-        load_per_block(str(blocks_csv)),
-        load_hourly_weights(str(hourly_csv)),
-        per_block_weights=per_block_weights,
-    )
+    print(f"Loading per-block resources (cached): {PER_BLOCK_RES_PQ}")
+    per_block_res = build_per_block_resources()
+    blocks = merge_blocks_with_resources(load_per_block(str(blocks_csv)), per_block_res)
     print(f"  {blocks.height:,} blocks")
 
     print("Building chart...")
     fig = build_fig(blocks)
 
-    out_html = _HERE.parent / "figures" / "main.html"
+    out_html = _HERE.parent / "figures" / "historical_sim.html"
     out_html.parent.mkdir(parents=True, exist_ok=True)
 
     # Interactive HTML version — plotly.js + MathJax pulled from CDN so LaTeX
