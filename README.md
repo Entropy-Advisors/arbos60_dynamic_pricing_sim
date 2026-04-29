@@ -16,7 +16,7 @@ pip install -r requirements.txt
 # Pull source data (ClickHouse → data/ caches)
 python scripts/fetch_data.py
 
-# ArbOS 51 vs ArbOS 60 historical sim figure → figures/historical_sim.html
+# ArbOS 51 vs ArbOS 60 historical sim figure → figures/historical_sim_oct_today.html
 python scripts/historical_sim.py
 
 # Tx-clustering dashboard → figures/clustering.html
