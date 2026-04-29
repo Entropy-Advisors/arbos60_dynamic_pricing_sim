@@ -1,4 +1,4 @@
-# ArbOS 60 — clean export
+# Arbitrum Dynamic Pricing — Revenue Impact Simulation
 
 Standalone dynamic-pricing equations for ArbOS 51 and ArbOS 60, the main
 multi-panel figure comparing them against on-chain data (internal EA
@@ -9,7 +9,6 @@ See `docs/arbos51_vs_arbos60_equations.md` for the full equation reference.
 ## Commands
 
 ```bash
-cd /Users/mohammedbenseddik/Documents/Dev/EA/arbos60_clean
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
