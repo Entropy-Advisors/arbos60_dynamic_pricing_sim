@@ -25,6 +25,16 @@ from __future__ import annotations
 import numpy as np
 
 
+# ArbOS 51 Dia activated on Arbitrum One at 2026-01-08 17:00:00 UTC. Before
+# this the chain ran a single-constraint pricing controller (T = 7 Mgas/s,
+# A = 102 s, p_min = 0.01 gwei since ArbOS 20 Atlas, Mar 2024); after, the
+# 6-rung ladder + 0.02 gwei min that this class's defaults represent.
+ARBOS_DIA_ACTIVATION_UTC = np.datetime64("2026-01-08T17:00:00")
+ARBOS_DIA_ACTIVATION_S = int(
+    ARBOS_DIA_ACTIVATION_UTC.astype("datetime64[s]").astype(np.int64)
+)
+
+
 class Arbos51GasPricing:
     """ArbOS 51 single-dim geometric-ladder pricing engine."""
 
@@ -43,6 +53,10 @@ class Arbos51GasPricing:
         (60.0,      9),
     ]
 
+    # Pre-Dia (ArbOS 20 Atlas → ArbOS 50) single-constraint config.
+    PRE_DIA_LADDER: list[tuple[float, int]] = [(7.0, 102)]
+    PRE_DIA_P_MIN_GWEI: float = 0.01
+
     def __init__(
         self,
         ladder: list[tuple[float, int]] | None = None,
@@ -50,6 +64,13 @@ class Arbos51GasPricing:
     ):
         self.ladder     = ladder     if ladder     is not None else self.LADDER
         self.p_min_gwei = p_min_gwei if p_min_gwei is not None else self.P_MIN_GWEI
+
+    @classmethod
+    def pre_dia(cls) -> "Arbos51GasPricing":
+        """Pre-Dia engine: single (T = 7 Mgas/s, A = 102 s) constraint and
+        p_min = 0.01 gwei. Same backlog/exp machinery as Dia, just one
+        constraint and a lower floor."""
+        return cls(ladder=cls.PRE_DIA_LADDER, p_min_gwei=cls.PRE_DIA_P_MIN_GWEI)
 
     # ── 2. Time / aggregation helpers ───────────────────────────────────────
     @staticmethod
@@ -215,6 +236,34 @@ class Arbos51GasPricing:
         expo = self._ladder_exponent_from_inflow(total_gas, block_seconds, self.ladder)
         expo = np.maximum(expo, 0.0)
         return self.p_min_gwei * self.taylor4_exp(expo)
+
+    @classmethod
+    def historical_price_per_block(
+        cls,
+        total_gas: np.ndarray,
+        block_seconds: np.ndarray,
+    ) -> np.ndarray:
+        """Per-block price honoring the ArbOS 51 Dia activation boundary.
+
+        Blocks with `block_seconds < ARBOS_DIA_ACTIVATION_S` are priced with
+        the pre-Dia engine (single constraint, p_min = 0.01 gwei); blocks at
+        or after activation use the Dia engine (6-rung ladder, p_min = 0.02
+        gwei). Backlogs warm up independently per regime — matches the
+        on-chain reset at the upgrade.
+
+        Assumes `block_seconds` is sorted ascending.
+        """
+        n = block_seconds.shape[0]
+        if n == 0:
+            return np.zeros(0, dtype=np.float64)
+        split = int(np.searchsorted(block_seconds, ARBOS_DIA_ACTIVATION_S, side="left"))
+        if split == 0:
+            return cls().price_per_block(total_gas, block_seconds)
+        if split == n:
+            return cls.pre_dia().price_per_block(total_gas, block_seconds)
+        p_pre = cls.pre_dia().price_per_block(total_gas[:split], block_seconds[:split])
+        p_dia = cls().price_per_block(total_gas[split:], block_seconds[split:])
+        return np.concatenate([p_pre, p_dia])
 
     # ── 7. Per-tx pricing ───────────────────────────────────────────────────
     @staticmethod
