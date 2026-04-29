@@ -4,3 +4,8 @@ __pycache__/
 *.pyo
 .DS_Store
 .ipynb_checkpoints/
+
+# Everything in data/ is regeneratable: CSV caches via scripts/fetch_data.py,
+# multigas parquets via scripts/convert_tyler_extracts.py, per-block resource
+# parquet rebuilt on first plot_main.py run.
+data/
