@@ -61,7 +61,7 @@ class Arbos60GasPricing:
     #   sg = Storage Growth
     #   hg = History Growth
     #   l2 = L2 Calldata
-    # ── Version 1 — current Dia configuration (6-rung ladder, sets 1-3) ────
+    # ── Set 1 ──────────────────────────────────────────────────────────────
     SET_WEIGHTS_1: dict[str, dict[str, float]] = {
         "First Set — Storage/Compute mix 1":   {"c": 1.0,    "sw": 0.67, "sr": 0.14, "sg": 0.06},
         "Second Set — Storage/Compute mix 2":  {"c": 0.0625, "sw": 1.0,  "sr": 0.21, "sg": 0.09},
@@ -86,10 +86,7 @@ class Arbos60GasPricing:
         ],
     }
 
-    # ── Version 2 — alternative parameterisation under evaluation ──────────
-    # Compressed 2-rung ladder per set (sets 1-3) with slightly retuned
-    # weights for set 1 (0.6714 / 0.141 / 0.0604 vs the v1 0.67 / 0.14 /
-    # 0.06). Set 4 stays single-rung.
+    # ── Set 2 ──────────────────────────────────────────────────────────────
     SET_WEIGHTS_2: dict[str, dict[str, float]] = {
         "First Set — Storage/Compute mix 1":   {"c": 1.0,    "sw": 0.6714, "sr": 0.141, "sg": 0.0604},
         "Second Set — Storage/Compute mix 2":  {"c": 0.0625, "sw": 1.0,    "sr": 0.21,  "sg": 0.09},
@@ -103,7 +100,7 @@ class Arbos60GasPricing:
         "Fourth Set — Long-term Disk Growth":  [( 2.30, 36_000)],
     }
 
-    # Map: set version number → (weights, ladders) pair.
+    # Map: set number → (weights, ladders) pair.
     _SETS: dict[int, tuple[dict, dict]] = {
         1: (SET_WEIGHTS_1, SET_LADDERS_1),
         2: (SET_WEIGHTS_2, SET_LADDERS_2),
@@ -127,9 +124,8 @@ class Arbos60GasPricing:
         set_ladders: dict[str, list[tuple[float, int]]] | None = None,
         p_min_gwei: float | None = None,
     ):
-        """`version=1` (default) → current Dia config (6-rung ladders).
-        `version=2` → alternative under evaluation (2-rung ladders).
-        Explicit `set_weights` / `set_ladders` override the version preset."""
+        """`version` selects which (weights, ladders) preset to use; see
+        `_SETS`. Explicit `set_weights` / `set_ladders` override the preset."""
         if version not in self._SETS:
             raise ValueError(
                 f"Unknown version {version}; available: {sorted(self._SETS)}"
