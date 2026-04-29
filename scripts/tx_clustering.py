@@ -25,12 +25,11 @@ diagnostic curves (4 metrics × 2 feature sets), per-cluster centroid bars,
 and cluster-size distribution.
 
 Run:
-    python report/scripts/cluster_tx_resources.py
-    python report/scripts/cluster_tx_resources.py --k 4 --algo kmeans --features clr
-    python report/scripts/cluster_tx_resources.py --decompressed-cache /tmp/multigas.csv
+    python scripts/tx_clustering.py
+    python scripts/tx_clustering.py --k 4 --algo kmeans --features clr
 
 Output:
-    report/figures/fig_tx_clusters_dashboard.html
+    figures/clustering.html
 """
 
 from __future__ import annotations
@@ -61,15 +60,10 @@ from sklearn.mixture import GaussianMixture
 
 
 # ── Paths ───────────────────────────────────────────────────────────────────
-DATA = pathlib.Path(
-    "/Users/mohammedbenseddik/Documents/Dev/EA/arbos60/data/Multigas Data.csv.gz"
-)
-BLOCKS_CSV = pathlib.Path(
-    "/Users/mohammedbenseddik/Documents/Dev/EA/arbos60/data/arbitrum_revenue_per_block.csv"
-)
-OUT_HTML = (
-    pathlib.Path(__file__).resolve().parent.parent / "figures" / "clustering.html"
-)
+_HERE = pathlib.Path(__file__).resolve().parent
+DATA       = _HERE.parent / "data" / "multigas_usage_extracts" / "2026-01" / "per_tx.parquet"
+BLOCKS_CSV = _HERE.parent / "data" / "onchain_blocks_transactions" / "per_block.csv"
+OUT_HTML = _HERE.parent / "figures" / "clustering.html"
 
 # ── Hyperparameters ─────────────────────────────────────────────────────────
 K_RANGE        = list(range(2, 9))   # 2..8
@@ -77,18 +71,15 @@ N_SAMPLE       = 30_000              # reservoir-sampled rows for sample-only al
 N_TSNE         = 12_000              # rows embedded by t-SNE (per feature set)
 N_METRIC       = 10_000              # rows used to compute O(N²) silhouette
 N_HDB          = 15_000              # rows used by HDBSCAN
-CHUNKSIZE      = 1_000_000           # rows per pandas chunk
+CHUNKSIZE      = 1_000_000           # rows per chunk
 MBK_BATCH      = 8_192               # MiniBatchKMeans inner batch
 RNG_SEED       = 42
 MIN_PRICED_GAS = 30_000              # drop trivially small txs (degenerate corner)
 CLR_EPS        = 1e-3                # additive smoothing for CLR log(0)
 HDB_MIN_CLUSTER = 200                # ~1.3% of 15K — smallest meaningful cluster
-TOTAL_TX_ROWS  = 58_280_366          # for reservoir-fraction sizing
-
-# Storage-access R:W split (must match plot_constraints_overlay.py).
-R_OVER_W_RATIO = 3.22
-SA_WRITE_SHARE = 1.0 / (R_OVER_W_RATIO + 1.0)
-SA_READ_SHARE  = R_OVER_W_RATIO / (R_OVER_W_RATIO + 1.0)
+# Conservative upper bound used for reservoir-fraction sizing. Exact row
+# counts are inferred at runtime from the parquet metadata.
+TOTAL_TX_ROWS_DEFAULT = 100_000_000
 
 WEIGHT_COLS = ["w_c", "w_sw", "w_sr", "w_sg", "w_hg", "w_l2"]
 CLR_COLS    = ["x_c", "x_sw", "x_sr", "x_sg", "x_hg", "x_l2"]
@@ -132,10 +123,6 @@ def parse_args() -> argparse.Namespace:
                    help="Override the auto-selected algorithm")
     p.add_argument("--features", choices=["clr", "log"], default=None,
                    help="Override the highlighted feature set in the dashboard")
-    p.add_argument("--decompressed-cache", type=pathlib.Path, default=None,
-                   help="Path to a (lazily-created) uncompressed CSV cache; if "
-                        "the file exists polars reads it ~5-10x faster than "
-                        "pandas+gzip; if missing, it is written on first run.")
     return p.parse_args()
 
 
@@ -165,9 +152,8 @@ def _featurize_chunk(
     aligned with sample_df rows.
     """
     g_c   = (chunk["computation"] + chunk["wasmComputation"]).astype(np.float64)
-    sa    = chunk["storageAccess"].astype(np.float64)
-    g_sw  = sa * SA_WRITE_SHARE
-    g_sr  = sa * SA_READ_SHARE
+    g_sw  = chunk["storageAccessWrite"].astype(np.float64)
+    g_sr  = chunk["storageAccessRead"].astype(np.float64)
     g_sg  = chunk["storageGrowth"].astype(np.float64)
     g_hg  = chunk["historyGrowth"].astype(np.float64)
     g_l2  = chunk["l2Calldata"].astype(np.float64)
@@ -200,55 +186,35 @@ def _featurize_chunk(
 
 
 # ── Streaming I/O ───────────────────────────────────────────────────────────
-def _iter_chunks(
-    path: pathlib.Path,
-    cache: pathlib.Path | None,
-) -> Iterator[pd.DataFrame]:
-    """
-    Yield 1 M-row chunks from the multigas csv.
+def _iter_chunks(path: pathlib.Path) -> Iterator[pd.DataFrame]:
+    """Yield CHUNKSIZE-row pandas frames from the per-tx parquet.
 
-    If `cache` is given and exists, read it via polars (uncompressed = ~10×
-    pandas-gzip rate). If `cache` is given and missing, decompress once on
-    the fly into the cache, then read from cache. Otherwise stream from
-    `path` (gzip) directly via pandas.
+    Uses pyarrow's row-group iterator so we never materialise the full file
+    in memory; pandas conversion is per-batch.
     """
+    import pyarrow.parquet as pq
+
     cols = [
         "block", "tx_hash",
         "computation", "wasmComputation",
-        "historyGrowth", "storageAccess", "storageGrowth",
-        "l2Calldata",
+        "historyGrowth",
+        "storageAccessRead", "storageAccessWrite",
+        "storageGrowth", "l2Calldata",
     ]
-    if cache is not None and cache.exists():
-        import polars as pl
-        # Read in batches by streaming the lazy frame.
-        lf = pl.scan_csv(str(cache)).select(cols)
-        # Polars doesn't have a native chunked iterator over a lazy frame
-        # of an arbitrary size, but `collect(streaming=True)` materialises
-        # the full frame; we slice it row-wise to keep peak memory bounded.
-        df = lf.collect(streaming=True)
-        n = df.height
-        for start in range(0, n, CHUNKSIZE):
-            yield df.slice(start, CHUNKSIZE).to_pandas()
-        return
+    pf = pq.ParquetFile(str(path))
+    for batch in pf.iter_batches(batch_size=CHUNKSIZE, columns=cols):
+        yield batch.to_pandas()
 
-    if cache is not None and not cache.exists():
-        print(f"  decompressing {path.name} → {cache} (one-time)...")
-        import gzip, shutil
-        with gzip.open(path, "rb") as src, open(cache, "wb") as dst:
-            shutil.copyfileobj(src, dst, length=64 << 20)
-        # Recurse to use the newly-created cache.
-        yield from _iter_chunks(path, cache)
-        return
 
-    yield from pd.read_csv(
-        path, compression="gzip", chunksize=CHUNKSIZE, usecols=cols,
-    )
+def _total_rows(path: pathlib.Path) -> int:
+    """Cheap row-count from parquet metadata — used for reservoir sizing."""
+    import pyarrow.parquet as pq
+    return pq.ParquetFile(str(path)).metadata.num_rows
 
 
 # ── Main streaming pass ─────────────────────────────────────────────────────
 def stream_fit_and_sample(
     path: pathlib.Path,
-    cache: pathlib.Path | None,
     rng: np.random.Generator,
 ) -> tuple[
     pd.DataFrame,
@@ -282,14 +248,15 @@ def stream_fit_and_sample(
         for K in K_RANGE
     }
 
-    keep_frac = min(1.0, (N_SAMPLE * 1.4) / TOTAL_TX_ROWS)
+    total_rows = _total_rows(path) or TOTAL_TX_ROWS_DEFAULT
+    keep_frac = min(1.0, (N_SAMPLE * 1.4) / max(total_rows, 1))
     sample_parts: list[pd.DataFrame] = []
     n_priced = 0
     n_scanned = 0
     log_mean = log_std = None
     t0 = time.time()
 
-    for i, chunk in enumerate(_iter_chunks(path, cache)):
+    for i, chunk in enumerate(_iter_chunks(path)):
         # Bootstrap log scaling stats from the first chunk only. Use the
         # un-standardized log values to derive mean/std, then re-featurize
         # the chunk with the stats applied so it matches all subsequent
@@ -1033,7 +1000,7 @@ def main():
     print(f"streaming {DATA.name} → 14× MiniBatchKMeans + reservoir sample...")
     t_stream = time.time()
     sample, mbk_clr, mbk_log, n_priced, log_mean, log_std = stream_fit_and_sample(
-        DATA, args.decompressed_cache, rng,
+        DATA, rng,
     )
     print(f"  streaming pass: {time.time() - t_stream:.1f}s, "
           f"{n_priced:,} priced txs, sample {len(sample):,}")
