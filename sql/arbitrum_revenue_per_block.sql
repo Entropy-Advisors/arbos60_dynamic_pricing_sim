@@ -1,36 +1,40 @@
--- Arbitrum Revenue — Per-Block (Jan 9–31 2026) [ClickHouse]
+-- Arbitrum Revenue — Per-Block (templated date window) [ClickHouse]
 --
--- ClickHouse port of arbitrum_revenue_per_block.sql.
--- Key dialect differences from Trino/DuneSQL:
---   TRY_CAST(x AS DOUBLE)  →  toFloat64(x)
---   NULLIF(x, 0)           →  nullIf(x, 0)
---   DATE 'yyyy-mm-dd'      →  toDate('yyyy-mm-dd')
---   GROUP BY 1, 2          →  GROUP BY block_number, block_date  (positional ok too)
+-- Date window driven by {{start_date}} / {{end_date}} placeholders that
+-- scripts/fetch_data.py substitutes at run time.
+--
+-- p_min_gwei is time-varying across the analysis window:
+--   ArbOS 20 "Atlas"  (Mar 18 2024 → Jan 8 2026 17:00 UTC):  0.01 gwei
+--   ArbOS 51 "Dia"    (Jan 8 2026 17:00 UTC →):              0.02 gwei
 --
 -- Source table: raw_arbitrum.v_receipts
 --   (NOT v_transactions — effective_gas_price is unpopulated there;
 --    v_receipts.effective_gas_price is UInt64 and correctly filled)
--- Output: data/arbitrum_revenue_per_block.csv
+-- Output: data/onchain_blocks_transactions/per_block.parquet
 
 WITH block_fees AS (
     SELECT
         block_number,
         block_date,
-        MIN(block_time)                                                         AS block_time,
+        MIN(block_time)                                                         AS block_time_min,
 
         COUNT(*)                                                                AS tx_count,
 
         -- ── Fee decomposition (ETH) ───────────────────────────────────────────
+        -- p_min flips at the ArbOS 51 Dia activation (Jan 8 2026 17:00 UTC).
 
-        -- l2_base = P_min × g_L2  (P_min = 0.02 gwei, constant in this range)
+        -- l2_base = P_min × g_L2
         SUM(
-            0.02e9
+            (CASE WHEN block_time < toDateTime('2026-01-08 17:00:00')
+                  THEN 0.01e9 ELSE 0.02e9 END)
             * toFloat64(gas_used - gas_used_for_l1)
         ) / 1e18                                                                AS l2_base,
 
         -- l2_surplus = (P_eff - P_min) × g_L2
         SUM(
-            (toFloat64(effective_gas_price) - 0.02e9)
+            (toFloat64(effective_gas_price) -
+             (CASE WHEN block_time < toDateTime('2026-01-08 17:00:00')
+                   THEN 0.01e9 ELSE 0.02e9 END))
             * toFloat64(gas_used - gas_used_for_l1)
         ) / 1e18                                                                AS l2_surplus,
 
@@ -58,8 +62,8 @@ WITH block_fees AS (
 
     FROM raw_arbitrum.v_receipts
     WHERE
-        block_date >= toDate('2026-01-09')
-        AND block_date <  toDate('2026-02-01')
+        block_date >= toDate('{{start_date}}')
+        AND block_date <  toDate('{{end_date}}')
     GROUP BY
         block_number,
         block_date
@@ -68,7 +72,7 @@ WITH block_fees AS (
 SELECT
     block_number,
     block_date,
-    block_time,
+    block_time_min                                                             AS block_time,
     tx_count,
 
     -- Fee decomposition (ETH)
@@ -84,11 +88,13 @@ SELECT
 
     -- Pricing
     avg_eff_price / 1e9                                                        AS avg_eff_price_gwei,
-    0.02                                                                       AS p_min_gwei,
+    CASE WHEN block_time_min < toDateTime('2026-01-08 17:00:00')
+         THEN 0.01 ELSE 0.02 END                                               AS p_min_gwei,
 
     -- Backlog pressure proxy: (P_eff / P_min) − 1
     -- 0 = at floor, >0 = congested
-    (avg_eff_price / 0.02e9) - 1.0                                             AS surplus_ratio
+    avg_eff_price / (CASE WHEN block_time_min < toDateTime('2026-01-08 17:00:00')
+                          THEN 0.01e9 ELSE 0.02e9 END) - 1.0                   AS surplus_ratio
 
 FROM block_fees
 ORDER BY block_number

@@ -6,7 +6,7 @@ Runs the SQL queries in `sql/arbitrum_revenue_per_block.sql` and
 results to `data/onchain_blocks_transactions/`, and skips re-querying if the
 cache already exists.
 
-    sql/arbitrum_revenue_per_block.sql  → data/onchain_blocks_transactions/per_block.csv
+    sql/arbitrum_revenue_per_block.sql  → data/onchain_blocks_transactions/per_block.parquet
     sql/arbitrum_revenue_per_tx.sql     → data/onchain_blocks_transactions/per_tx.parquet
 
 Per-tx is fetched day by day to keep ClickHouse memory bounded; the per-block
@@ -42,13 +42,15 @@ ENV_PATH = pathlib.Path(
     )
 )
 
-START_DATE = "2026-01-09"
-END_DATE   = "2026-02-01"   # exclusive
+from datetime import date, timedelta
+START_DATE = "2025-10-01"   # first day of multigas extract coverage
+# Exclusive — defaults to tomorrow so today's blocks are included.
+END_DATE   = (date.today() + timedelta(days=1)).isoformat()
 
-PER_BLOCK_SQL  = SQL_DIR / "arbitrum_revenue_per_block.sql"
-PER_TX_SQL     = SQL_DIR / "arbitrum_revenue_per_tx.sql"
-PER_BLOCK_CSV  = DATA_DIR / "per_block.csv"
-PER_TX_PARQUET = DATA_DIR / "per_tx.parquet"
+PER_BLOCK_SQL      = SQL_DIR / "arbitrum_revenue_per_block.sql"
+PER_TX_SQL         = SQL_DIR / "arbitrum_revenue_per_tx.sql"
+PER_BLOCK_PARQUET  = DATA_DIR / "per_block.parquet"
+PER_TX_PARQUET     = DATA_DIR / "per_tx.parquet"
 
 
 def _client():
@@ -80,55 +82,68 @@ def _read_sql(path: pathlib.Path, **subs) -> str:
 
 
 def fetch_per_block(client, force: bool = False) -> pathlib.Path:
-    """Run the per-block SQL once, write CSV."""
-    if PER_BLOCK_CSV.exists() and not force:
-        print(f"  per-block cache exists: {PER_BLOCK_CSV.name} "
-              f"({PER_BLOCK_CSV.stat().st_size / 1e6:.1f} MB) — skip")
-        return PER_BLOCK_CSV
-    print("  running per-block query (single round-trip)...")
+    """Run the per-block SQL once, write parquet (zstd)."""
+    if PER_BLOCK_PARQUET.exists() and not force:
+        print(f"  per-block cache exists: {PER_BLOCK_PARQUET.name} "
+              f"({PER_BLOCK_PARQUET.stat().st_size / 1e6:.1f} MB) — skip")
+        return PER_BLOCK_PARQUET
+    print(f"  running per-block query for {START_DATE} → {END_DATE} (exclusive)...")
     sql = _read_sql(PER_BLOCK_SQL, start_date=START_DATE, end_date=END_DATE)
     df = client.query_df(sql)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_csv(PER_BLOCK_CSV, index=False)
-    print(f"  wrote {PER_BLOCK_CSV.name}: {len(df):,} blocks, "
-          f"{PER_BLOCK_CSV.stat().st_size / 1e6:.1f} MB")
-    return PER_BLOCK_CSV
+    df.to_parquet(PER_BLOCK_PARQUET, compression="zstd")
+    print(f"  wrote {PER_BLOCK_PARQUET.name}: {len(df):,} blocks, "
+          f"{PER_BLOCK_PARQUET.stat().st_size / 1e6:.1f} MB")
+    return PER_BLOCK_PARQUET
 
 
 def fetch_per_tx(client, force: bool = False) -> pathlib.Path:
-    """Run the per-tx SQL day-by-day (memory-bounded), write parquet."""
+    """Run the per-tx SQL day-by-day, streaming each day's batch to parquet
+    via pyarrow. Memory stays bounded by one day's rows (~5 M)."""
     if PER_TX_PARQUET.exists() and not force:
         print(f"  per-tx cache exists: {PER_TX_PARQUET.name} "
               f"({PER_TX_PARQUET.stat().st_size / 1e6:.1f} MB) — skip")
         return PER_TX_PARQUET
 
-    chunks: list[pd.DataFrame] = []
-    for day in pd.date_range(START_DATE, END_DATE, freq="D", inclusive="left"):
-        ds = f"{day:%Y-%m-%d}"
-        next_ds = f"{day + pd.Timedelta(days=1):%Y-%m-%d}"
-        sql = _read_sql(PER_TX_SQL, start_date=ds, end_date=next_ds)
-        d = client.query_df(sql)
-        # Compact dtypes before holding in memory.
-        for col, t in [
-            ("block_number", np.int64),
-            ("eff_price_gwei", np.float64),
-            ("gas_used", np.float64),
-            ("gas_used_for_l1", np.float64),
-            ("l2_gas", np.float64),
-            ("l2_base", np.float64),
-            ("l2_surplus", np.float64),
-            ("l1_fees", np.float64),
-            ("total_fees", np.float64),
-        ]:
-            if col in d.columns:
-                d[col] = d[col].astype(t)
-        chunks.append(d)
-        print(f"    {ds}: {len(d):,} txs")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
-    df = pd.concat(chunks, ignore_index=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(PER_TX_PARQUET, compression="snappy")
-    print(f"  wrote {PER_TX_PARQUET.name}: {len(df):,} txs, "
+    writer: pq.ParquetWriter | None = None
+    total_rows = 0
+
+    dtypes = [
+        ("block_number",    np.int64),
+        ("eff_price_gwei",  np.float64),
+        ("gas_used",        np.float64),
+        ("gas_used_for_l1", np.float64),
+        ("l2_gas",          np.float64),
+        ("l2_base",         np.float64),
+        ("l2_surplus",      np.float64),
+        ("l1_fees",         np.float64),
+        ("total_fees",      np.float64),
+    ]
+    try:
+        for day in pd.date_range(START_DATE, END_DATE, freq="D", inclusive="left"):
+            ds      = f"{day:%Y-%m-%d}"
+            next_ds = f"{day + pd.Timedelta(days=1):%Y-%m-%d}"
+            sql = _read_sql(PER_TX_SQL, start_date=ds, end_date=next_ds)
+            d   = client.query_df(sql)
+            for col, t in dtypes:
+                if col in d.columns:
+                    d[col] = d[col].astype(t)
+
+            table = pa.Table.from_pandas(d, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(str(PER_TX_PARQUET), table.schema, compression="zstd")
+            writer.write_table(table)
+            total_rows += len(d)
+            print(f"    {ds}: {len(d):>10,} txs   (total {total_rows:>11,})")
+    finally:
+        if writer is not None:
+            writer.close()
+
+    print(f"  wrote {PER_TX_PARQUET.name}: {total_rows:,} txs, "
           f"{PER_TX_PARQUET.stat().st_size / 1e6:.1f} MB")
     return PER_TX_PARQUET
 
