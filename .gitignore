@@ -9,3 +9,6 @@ __pycache__/
 # multigas parquets via scripts/convert_tyler_extracts.py, per-block resource
 # parquet rebuilt on first plot_main.py run.
 data/
+
+# Local credentials (Dune / ClickHouse). Never commit.
+.env
