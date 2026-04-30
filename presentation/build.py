@@ -98,8 +98,8 @@ def fig_hourly_combined(rk_hr: pl.DataFrame) -> go.Figure:
         vertical_spacing=0.06,
         row_heights=[0.55, 0.45],
         subplot_titles=(
-            "Hourly priced gas usage — by resource (Mgas)",
-            "Resource composition — share of priced gas (%)",
+            "Hourly priced gas usage, by resource (Mgas)",
+            "Resource composition: share of priced gas (%)",
         ),
     )
 
@@ -150,34 +150,49 @@ def fig_hourly_combined(rk_hr: pl.DataFrame) -> go.Figure:
     return fig
 
 
-# ── Stat block (slide 1) ────────────────────────────────────────────────────
+# ── Stat block (slide 2) ────────────────────────────────────────────────────
+def _total_txs() -> int:
+    """Sum row counts across every per_tx.parquet via parquet metadata
+    (no row scan)."""
+    import pyarrow.parquet as pq
+    paths = sorted((_ROOT / "data" / "multigas_usage_extracts")
+                   .glob("*/per_tx.parquet"))
+    return sum(pq.ParquetFile(str(p)).metadata.num_rows for p in paths)
+
+
 def stat_html(blocks_wide: pl.DataFrame, blocks: pl.DataFrame) -> str:
     date_min = blocks_wide["block_date"].min()
     date_max = blocks_wide["block_date"].max()
     n_days   = (date_max - date_min).days + 1
 
-    n_blocks_full   = blocks_wide.height
-    n_blocks_priced = blocks.height
-    coverage_pct    = 100.0 * n_blocks_priced / max(n_blocks_full, 1)
+    n_blocks_full = blocks_wide.height
+    n_txs         = _total_txs()
 
-    # Total priced gas (Tgas).
+    # Total priced gas (Tgas) — 7 resources counted (incl L1 calldata,
+    # which is tracked even though ArbOS 60 doesn't price it dynamically).
     total_priced_gas = sum(
         float(blocks[f"{c}"].sum()) if c != "computation"
         else float((blocks["computation"] + blocks["wasmComputation"]).sum())
         for c in [
             "computation", "storageAccessRead", "storageAccessWrite",
-            "storageGrowth", "historyGrowth", "l2Calldata",
+            "storageGrowth", "historyGrowth", "l2Calldata", "l1Calldata",
         ]
     )
-    total_priced_tgas = total_priced_gas / 1e12
+    total_gas_tgas = total_priced_gas / 1e12
+
+    resource_names = (
+        "Computation, Storage Read, Storage Write, Storage Growth, "
+        "History Growth, L2 Calldata, L1 Calldata"
+    )
 
     rows = [
-        ("Window",            f"{date_min} → {date_max}"),
-        ("Days",              f"{n_days:,}"),
-        ("Blocks (full)",     f"{n_blocks_full:,}"),
-        ("Blocks (multigas)", f"{n_blocks_priced:,} ({coverage_pct:.1f}%)"),
-        ("Total priced gas",  f"{total_priced_tgas:,.2f} Tgas"),
-        ("Resource kinds",    "6 priced (Comp, SR, SW, SG, HG, L2 calldata)"),
+        ("Window",              f"{date_min} → {date_max}"),
+        ("Days",                f"{n_days:,}"),
+        ("Total blocks",        f"{n_blocks_full:,}"),
+        ("Total transactions",  f"{n_txs:,}"),
+        ("Total gas",           f"{total_gas_tgas:,.2f} Tgas"),
+        ("Resources tracked",
+                                f"7: {resource_names}"),
     ]
     body = "\n".join(
         f'<div class="label">{k}</div><div class="val">{v}</div>'
@@ -202,7 +217,7 @@ PAGE_TEMPLATE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Arbitrum Dynamic Pricing Update — Revenue Impact Analysis</title>
+  <title>Arbitrum Dynamic Pricing Update: Revenue Impact Analysis</title>
 
   <link rel="stylesheet" href="{REVEAL_CDN}/dist/reset.css">
   <link rel="stylesheet" href="{REVEAL_CDN}/dist/reveal.css">
@@ -291,6 +306,15 @@ PAGE_TEMPLATE = """<!doctype html>
       font-size: 0.6em; color: #444; margin-top: 0.2em;
       line-height: 1.45;
     }}
+    .source-tables {{
+      margin-top: 0.45em; display: flex; flex-wrap: wrap; gap: 0.4em;
+    }}
+    .source-tables .entity {{
+      font-size: 0.55em; font-weight: 500;
+      color: #1f3a5f; background: #e9f0fa;
+      border: 1px solid #c8d6ec; border-radius: 3px;
+      padding: 0.1em 0.55em;
+    }}
 
     .footer {{ font-size: 0.6em; color: #888; margin-top: 1.2em; }}
 
@@ -343,7 +367,7 @@ PAGE_TEMPLATE = """<!doctype html>
 
     <!-- Slide 2: dataset scope -->
     <section>
-      <h2>Historical simulation — data scope</h2>
+      <h2>Historical simulation: data scope</h2>
       {STATS}
       <h3 style="margin-top:1.4em">Data sources</h3>
       <div class="source-list">
@@ -353,9 +377,14 @@ PAGE_TEMPLATE = """<!doctype html>
             <span class="src-tag">Internal EA db</span>
           </div>
           <div class="source-desc">
-            Block headers, tx counts, base fees, L1 calldata costs.
-            Wide window — drives the observed-on-chain reference series
-            and the ArbOS 51 baseline simulation.
+            Block headers, tx counts, base fees, L1 calldata costs and
+            reverts. Wide window. Drives the observed-on-chain reference
+            series, the ArbOS 51 baseline and the spam-classification flags.
+          </div>
+          <div class="source-tables">
+            <span class="entity">Blocks</span>
+            <span class="entity">Transactions</span>
+            <span class="entity">Reverted transactions</span>
           </div>
         </div>
         <div class="source">
@@ -369,13 +398,17 @@ PAGE_TEMPLATE = """<!doctype html>
             L2/L1 calldata, WASM compute). Drives the ArbOS 60 + per-
             resource backlog panels.
           </div>
+          <div class="source-tables">
+            <span class="entity">Blocks</span>
+            <span class="entity">Transactions (with per-resource gas)</span>
+          </div>
         </div>
       </div>
     </section>
 
     <!-- Slide 3: hourly resource — absolute + share, stacked -->
     <section class="chart-slide">
-      <h2>Hourly priced gas — absolute &amp; composition</h2>
+      <h2>Hourly priced gas: absolute and composition</h2>
       <h3>Top: Mgas/hr by resource. Bottom: same data, normalised to 100 %.</h3>
       <div class="plotly-frame">{FIG1}</div>
     </section>
