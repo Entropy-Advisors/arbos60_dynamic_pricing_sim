@@ -659,7 +659,7 @@ def arbos60_code_slide_html() -> str:
     return (
         '<section>\n'
         '  <section>\n'
-        '    <h2>ArbOS 60 dynamic pricing implemented in code: spec</h2>\n'
+        '    <h2>ArbOS 60 dynamic pricing implemented in code</h2>\n'
         f'    {spec_block}\n'
         '  </section>\n'
         '  <section>\n'
@@ -1046,27 +1046,37 @@ def fig_per_resource_histograms(hist: dict) -> go.Figure:
 
 def tx_resource_stats_html(hist: dict) -> str:
     """Per-resource descriptive stats from the full-dataset histogram
-    accumulator.  Mean, %zero and total count are exact; the percentile
-    columns are linear-interpolated from the fine-bin histogram (500 bins
-    on log1p, ≤ 0.5% relative error in practice)."""
+    accumulator.  Mean and %zero are exact (streamed sums / counts);
+    the percentile columns are linear-interpolated from the fine-bin
+    histogram (500 bins on log1p, ≤ 0.5% relative error in practice).
+    Mean and Median are split into Pre-DIA / Post-DIA / All-time."""
     edges_fine = hist["edges_fine"]
     rows: list[dict] = []
     n_grand_total = 0
     for name, _src in RESOURCE_SPEC:
         key = name.replace(" ", "_")
-        # Combine pre & post regimes for the all-time stats row.
-        fine = hist[f"fine_{key}_pre"] + hist[f"fine_{key}_post"]
-        s_g  = float(hist[f"sum_{key}_pre"]) + float(hist[f"sum_{key}_post"])
-        n_z  = int(hist[f"nzero_{key}_pre"]) + int(hist[f"nzero_{key}_post"])
-        n_t  = int(hist[f"ntot_{key}_pre"])  + int(hist[f"ntot_{key}_post"])
+        fine_pre  = hist[f"fine_{key}_pre"]
+        fine_post = hist[f"fine_{key}_post"]
+        fine_all  = fine_pre + fine_post
+        s_pre  = float(hist[f"sum_{key}_pre"])
+        s_post = float(hist[f"sum_{key}_post"])
+        n_pre  = int(hist[f"ntot_{key}_pre"])
+        n_post = int(hist[f"ntot_{key}_post"])
+        n_z    = int(hist[f"nzero_{key}_pre"]) + int(hist[f"nzero_{key}_post"])
+        n_t    = n_pre + n_post
+
         rows.append({
-            "name":     name,
-            "mean":     s_g / max(n_t, 1),
-            "p25":      _percentile_from_hist(fine, edges_fine, 0.25),
-            "median":   _percentile_from_hist(fine, edges_fine, 0.50),
-            "p75":      _percentile_from_hist(fine, edges_fine, 0.75),
-            "p99":      _percentile_from_hist(fine, edges_fine, 0.99),
-            "pct_zero": 100.0 * n_z / max(n_t, 1),
+            "name":        name,
+            "mean_pre":    s_pre / max(n_pre, 1),
+            "mean_post":   s_post / max(n_post, 1),
+            "mean_all":    (s_pre + s_post) / max(n_t, 1),
+            "median_pre":  _percentile_from_hist(fine_pre,  edges_fine, 0.50),
+            "median_post": _percentile_from_hist(fine_post, edges_fine, 0.50),
+            "median_all":  _percentile_from_hist(fine_all,  edges_fine, 0.50),
+            "p25":         _percentile_from_hist(fine_all,  edges_fine, 0.25),
+            "p75":         _percentile_from_hist(fine_all,  edges_fine, 0.75),
+            "p99":         _percentile_from_hist(fine_all,  edges_fine, 0.99),
+            "pct_zero":    100.0 * n_z / max(n_t, 1),
         })
         n_grand_total = max(n_grand_total, n_t)
     n = n_grand_total
@@ -1078,10 +1088,37 @@ def tx_resource_stats_html(hist: dict) -> str:
             return f"{v/1e3:,.1f}K"
         return f"{v:,.0f}"
 
-    headers = ["Resource", "Mean", "P25", "Median", "P75", "P99", "% zero"]
-    th = "".join(
-        f'<th>{h}</th>' if h == "Resource" else f'<th class="num">{h}</th>'
-        for h in headers
+    def cell(v: float, extra: str = "") -> str:
+        """Format a numeric cell.  Zero values get a `zero` class so the
+        cell dims — heavy-tailed resources push 50%+ of txs to 0 and the
+        clusters of bare `0` were hard to scan otherwise."""
+        cls = " ".join(filter(None, ["num", extra, "zero" if v == 0 else ""]))
+        return f'<td class="{cls}">{fmt(v)}</td>'
+
+    # Two-row header: top groups Mean / Median into Pre / Post / All
+    # tri-columns, with the other percentile / %zero columns spanning
+    # both rows.  Visual separators between regime groups so the eye
+    # parses the tri-cells without confusion.
+    head = (
+        '<thead>'
+        '  <tr>'
+        '    <th rowspan="2">Resource</th>'
+        '    <th colspan="3" class="grp">Mean</th>'
+        '    <th colspan="3" class="grp">Median</th>'
+        '    <th rowspan="2" class="num">P25</th>'
+        '    <th rowspan="2" class="num">P75</th>'
+        '    <th rowspan="2" class="num">P99</th>'
+        '    <th rowspan="2" class="num">% zero</th>'
+        '  </tr>'
+        '  <tr>'
+        '    <th class="num sub">Pre</th>'
+        '    <th class="num sub">Post</th>'
+        '    <th class="num sub">All</th>'
+        '    <th class="num sub">Pre</th>'
+        '    <th class="num sub">Post</th>'
+        '    <th class="num sub">All</th>'
+        '  </tr>'
+        '</thead>'
     )
     body = []
     for r in rows:
@@ -1089,16 +1126,20 @@ def tx_resource_stats_html(hist: dict) -> str:
         body.append(
             f'<tr class="{emphasise}">'
             f'<td>{r["name"]}</td>'
-            f'<td class="num">{fmt(r["mean"])}</td>'
-            f'<td class="num">{fmt(r["p25"])}</td>'
-            f'<td class="num">{fmt(r["median"])}</td>'
-            f'<td class="num">{fmt(r["p75"])}</td>'
-            f'<td class="num">{fmt(r["p99"])}</td>'
+            f'{cell(r["mean_pre"])}'
+            f'{cell(r["mean_post"])}'
+            f'{cell(r["mean_all"], extra="bold")}'
+            f'{cell(r["median_pre"])}'
+            f'{cell(r["median_post"])}'
+            f'{cell(r["median_all"], extra="bold")}'
+            f'{cell(r["p25"])}'
+            f'{cell(r["p75"])}'
+            f'{cell(r["p99"])}'
             f'<td class="num">{r["pct_zero"]:.1f}%</td>'
             f'</tr>'
         )
     table = (
-        f'<table class="stats-table"><thead><tr>{th}</tr></thead>'
+        f'<table class="stats-table">{head}'
         f'<tbody>{"".join(body)}</tbody></table>'
     )
     def _human(n: int) -> str:
@@ -1261,18 +1302,21 @@ PAGE_TEMPLATE = """<!doctype html>
   <!-- MathJax: renders the LaTeX equations on the ArbOS 60 slide.
        `$...$` is intentionally NOT a delimiter — Python identifiers like
        `inflow_i_per_t` would otherwise be parsed as TeX subscripts and
-       throw "Double subscripts" warnings into the rendered slide.  We
-       also tell MathJax to skip the syntax-highlighted code spans
-       (`method-sig`, `args`, `code-pane`) so their underscores stay
-       cosmetic. -->
+       throw "Double subscripts" warnings into the rendered slide.
+
+       Strategy: skip the entire `reveal` container by default so plain
+       text like "(computation, storage read/write/growth, ...)" can't
+       be mis-parsed by MathJax's auto-detect, then re-enable only the
+       specific equation containers (`method-eq`, `spec-ineq`, `set-ineq`)
+       via `processHtmlClass`. -->
   <script>
     window.MathJax = {{
       tex: {{ inlineMath: [['\\(', '\\)']] }},
       options: {{
         skipHtmlTags: ['script', 'noscript', 'style', 'textarea',
                         'pre', 'code'],
-        ignoreHtmlClass: 'tex2jax_ignore|method-sig|args|set-table|spec-label|set-title|ladder-title|fee-label|class-doc',
-        processHtmlClass: 'tex2jax_process|method-eq|spec-ineq',
+        ignoreHtmlClass: 'tex2jax_ignore|reveal',
+        processHtmlClass: 'tex2jax_process|method-eq|spec-ineq|set-ineq',
       }},
       svg: {{ fontCache: 'global' }},
     }};
@@ -1347,6 +1391,24 @@ PAGE_TEMPLATE = """<!doctype html>
       padding: 0.4em 0.9em;
       background: rgba(31, 119, 180, 0.04);
     }}
+    /* Distinct accent per source so the two providers read at a glance.
+       Order: Arbitrum on-chain (Internal EA db) / Multi-gas extracts. */
+    .source-list .source:nth-child(1) {{
+      border-left-color: #08519c;
+      background: rgba(8, 81, 156, 0.05);
+    }}
+    .source-list .source:nth-child(1) .src-tag {{
+      color: #08519c; border-color: #b6cae6;
+      background: rgba(8, 81, 156, 0.08);
+    }}
+    .source-list .source:nth-child(2) {{
+      border-left-color: #ff7f0e;
+      background: rgba(255, 127, 14, 0.05);
+    }}
+    .source-list .source:nth-child(2) .src-tag {{
+      color: #b54a00; border-color: #f3c8a3;
+      background: rgba(255, 127, 14, 0.10);
+    }}
     .source-name {{
       font-weight: 600; font-size: 0.78em; color: #111;
     }}
@@ -1398,6 +1460,16 @@ PAGE_TEMPLATE = """<!doctype html>
       font-weight: 600; background: #fafafa;
       border-top: 2px solid #aaa;
     }}
+    /* Group / sub-header styling for the two-row tx stats table. */
+    table.stats-table th.grp {{
+      text-align: center; color: #444; font-weight: 600;
+      border-bottom: 1px solid #ccc;
+    }}
+    table.stats-table th.sub {{
+      font-weight: 500; font-size: 0.92em; color: #777;
+    }}
+    table.stats-table td.bold {{ font-weight: 600; }}
+    table.stats-table td.zero {{ color: #b0b0b0; font-weight: 400; }}
 
     /* Single visual language for every metric card.  All numbers use the
        slide's default sans-serif with tabular figures so digits align
@@ -1413,6 +1485,20 @@ PAGE_TEMPLATE = """<!doctype html>
       border-left: 3px solid #1f77b4;
       padding: 0.55em 0.95em;
       background: rgba(31, 119, 180, 0.04);
+    }}
+    /* Distinct accent per card so the four panels read at a glance.
+       Order: window split / daily L2 fees / day type / top peak days. */
+    .fee-stats-row .fee-card:nth-child(1) {{
+      border-left-color: #08519c;
+      background: rgba(8, 81, 156, 0.05);
+    }}
+    .fee-stats-row .fee-card:nth-child(2) {{
+      border-left-color: #2ca02c;
+      background: rgba(44, 160, 44, 0.05);
+    }}
+    .fee-stats-row .fee-card:nth-child(3) {{
+      border-left-color: #9467bd;
+      background: rgba(148, 103, 189, 0.05);
     }}
     .fee-label {{
       font-size: 0.55em; color: #555;
@@ -1754,7 +1840,6 @@ PAGE_TEMPLATE = """<!doctype html>
       </section>
       <section>
         <h2>Per-transaction gas distribution</h2>
-        <h3>Violin view, split Pre-DIA / Post-DIA. Dots are outliers</h3>
         <div class="hist-grid">{VIOLIN_FIG}</div>
         {STATS_TABLE_2}
       </section>
