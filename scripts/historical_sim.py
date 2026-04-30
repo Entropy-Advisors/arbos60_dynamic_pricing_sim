@@ -138,8 +138,8 @@ P_MIN_GWEI          = a51.p_min_gwei
 ARBOS51_LADDER      = a51.ladder
 SET_WEIGHTS         = a60.set_weights
 SET_LADDERS         = a60.set_ladders
-PRICED_SYMBOLS      = a60.PRICED_SYMBOLS
-PRICED_SYMBOL_LABELS = a60.PRICED_SYMBOL_LABELS
+GAS_RESOURCES      = a60.GAS_RESOURCES
+GAS_RESOURCE_LABELS = a60.GAS_RESOURCE_LABELS
 
 PRICED_KINDS = [
     "Computation",      # = computation + wasmComputation
@@ -149,7 +149,7 @@ PRICED_KINDS = [
     "HistoryGrowth",
     "L2Calldata",
 ]
-PRICED_SYMBOL_COLORS = {
+GAS_RESOURCE_COLORS = {
     "c":  "#1f77b4",   # Computation — blue
     "sw": "#2ca02c",   # Storage Write — green
     "sr": "#98df8a",   # Storage Read — light green
@@ -196,24 +196,28 @@ def price_arbos60_per_resource(
     blocks: pl.DataFrame,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
     """Per-block ArbOS 60 prices (gathered from per-second internals)."""
-    parts = a60.per_block_resource_gas(blocks)
-    bs    = _block_seconds(blocks)
-    secs, prices_per_sec, e_per_set = a60.price_per_resource(parts, bs)
-    sec_idx = (bs - secs[0]).astype(np.int64)
-    prices_pb = {k: prices_per_sec[k][sec_idx] for k in a60.PRICED_SYMBOLS}
-    return prices_pb, parts, e_per_set
+    g_per_block = a60.per_block_resource_gas(blocks)
+    block_t     = _block_seconds(blocks)
+    t_axis, prices_per_t, e_per_set = a60.price_per_resource(
+        g_per_block, block_t,
+    )
+    t_idx = (block_t - t_axis[0]).astype(np.int64)
+    prices_pb = {k: prices_per_t[k][t_idx] for k in a60.GAS_RESOURCES}
+    return prices_pb, g_per_block, e_per_set
 
 
 def _backlog_per_block_for_set(
-    inflow_pb: np.ndarray, block_seconds: np.ndarray, T_arr: np.ndarray,
+    inflow_i_per_block: np.ndarray, block_t: np.ndarray, T_i: np.ndarray,
 ) -> np.ndarray:
-    """Per-block backlog gather: aggregate per-block inflow to per-second,
-    run the 1-s recursion, gather back via the block's wall-clock-second
-    index. Used for the diagnostic backlog panels."""
-    secs, inflow_ps = a60.aggregate_per_second(inflow_pb, block_seconds)
-    B               = a60.backlog_per_second(inflow_ps, T_arr)        # (n_T, n_sec)
-    sec_idx         = (block_seconds - secs[0]).astype(np.int64)
-    return B[:, sec_idx]
+    """Per-block backlog gather: aggregate per-block inflow to per-t, run
+    the 1-s tick recursion, gather back via the block's wall-clock t index.
+    Used for the diagnostic backlog panels."""
+    t_axis, inflow_i_per_t = a60.aggregate_per_second(
+        inflow_i_per_block, block_t,
+    )
+    B_i   = a60.backlog_per_second(inflow_i_per_t, T_i)   # (n_j, n_t)
+    t_idx = (block_t - t_axis[0]).astype(np.int64)
+    return B_i[:, t_idx]
 
 
 def compute_arbos51_backlogs(
@@ -231,17 +235,18 @@ def compute_arbos51_backlogs(
 def compute_backlogs(
     blocks: pl.DataFrame,
 ) -> dict[str, dict[tuple[float, float], np.ndarray]]:
-    parts = a60.per_block_resource_gas(blocks)
-    bs    = _block_seconds(blocks)
+    g_per_block = a60.per_block_resource_gas(blocks)
+    block_t     = _block_seconds(blocks)
     out: dict[str, dict[tuple[float, float], np.ndarray]] = {}
-    for set_name, weights in a60.set_weights.items():
-        inflow_pb = np.zeros(blocks.height, dtype=np.float64)
-        for sym, w in weights.items():
-            inflow_pb = inflow_pb + w * parts[sym]
+    for set_name, a_i in a60.set_weights.items():
+        # inflow_i(per block) = Σ_k a_{i,k} · g_k(per block)
+        inflow_i_per_block = np.zeros(blocks.height, dtype=np.float64)
+        for k, a_ik in a_i.items():
+            inflow_i_per_block += a_ik * g_per_block[k]
         ladder = a60.set_ladders[set_name]
-        T_arr  = np.array([T for T, _ in ladder], dtype=np.float64)
-        B = _backlog_per_block_for_set(inflow_pb, bs, T_arr)
-        out[set_name] = {(T, A): B[i] for i, (T, A) in enumerate(ladder)}
+        T_i = np.array([T for T, _ in ladder], dtype=np.float64)
+        B_i = _backlog_per_block_for_set(inflow_i_per_block, block_t, T_i)
+        out[set_name] = {(T, A): B_i[j] for j, (T, A) in enumerate(ladder)}
     return out
 
 
@@ -264,10 +269,10 @@ def hourly_gas_per_kind(blocks: pl.DataFrame) -> pl.DataFrame:
 
 
 def weighted_inflow_mgas_hr(
-    rk_hr: pl.DataFrame, weights: dict[str, float],
+    rk_hr: pl.DataFrame, a_i: dict[str, float],
 ) -> np.ndarray:
-    """Hourly weighted inflow Σ_k w_k · g_k in Mgas/hour."""
-    parts = {
+    """Hourly weighted inflow Σ_k a_{i,k} · g_k in Mgas/hour for one set i."""
+    g_per_hour = {
         "c":  rk_hr["gas_Computation"].to_numpy(),
         "sw": rk_hr["gas_StorageWrite"].to_numpy(),
         "sr": rk_hr["gas_StorageRead"].to_numpy(),
@@ -276,8 +281,8 @@ def weighted_inflow_mgas_hr(
         "l2": rk_hr["gas_L2Calldata"].to_numpy(),
     }
     inflow = np.zeros(rk_hr.height, dtype=np.float64)
-    for sym, w in weights.items():
-        inflow = inflow + w * parts[sym]
+    for k, a_ik in a_i.items():
+        inflow += a_ik * g_per_hour[k]
     return inflow / 1e6  # Mgas/hour
 
 
@@ -290,17 +295,17 @@ def _ladder_line_style(i: int, n: int) -> tuple[str, float]:
     return dash, width
 
 
-def _weights_latex(weights: dict[str, float]) -> str:
-    """Return the LHS of the set's weighted inequality as LaTeX (no $ delimiters)."""
+def _weights_latex(a_i: dict[str, float]) -> str:
+    """Render set i's weighted inequality LHS  Σ_k a_{i,k}·g_k  as LaTeX."""
     pretty = {"c": "g_c", "sw": "g_{sw}", "sr": "g_{sr}",
               "sg": "g_{sg}", "hg": "g_{hg}", "l2": "g_{l2}"}
-    parts = []
-    for sym, w in weights.items():
-        if w == 1.0:
-            parts.append(pretty[sym])
+    terms = []
+    for k, a_ik in a_i.items():
+        if a_ik == 1.0:
+            terms.append(pretty[k])
         else:
-            parts.append(f"{w:g}\\,{pretty[sym]}")
-    return " + ".join(parts)
+            terms.append(f"{a_ik:g}\\,{pretty[k]}")
+    return " + ".join(terms)
 
 
 def _set_ladder_table_latex(set_name: str) -> str:
@@ -450,8 +455,8 @@ def aggregate_per_tx_hourly(
               pl.col("p60_fee").sum().alias("_p60_fee"),
               pl.col("total_gas").sum().alias("_total_gas"),
               pl.col("priced_gas").sum().alias("_priced_gas"),
-              *[pl.col(f"fee_{k}").sum().alias(f"_fee_{k}") for k in PRICED_SYMBOLS],
-              *[pl.col(f"g_{k}").sum().alias(f"_gas_{k}")  for k in PRICED_SYMBOLS],
+              *[pl.col(f"fee_{k}").sum().alias(f"_fee_{k}") for k in GAS_RESOURCES],
+              *[pl.col(f"g_{k}").sum().alias(f"_gas_{k}")  for k in GAS_RESOURCES],
           ])
           .sort("hour")
           .collect(engine="streaming")
@@ -463,7 +468,7 @@ def aggregate_per_tx_hourly(
         (pl.col("_p51_fee")  / pl.col("_total_gas")).alias("p51_gwei"),
         (pl.col("_p60_fee")  / pl.col("_priced_gas")).alias("p60_gwei"),
         *[(pl.col(f"_fee_{k}") / pl.col(f"_gas_{k}")).alias(f"p_{k}_gwei")
-          for k in PRICED_SYMBOLS],
+          for k in GAS_RESOURCES],
     ])
     return df
 
@@ -536,7 +541,7 @@ def build_fig(blocks: pl.DataFrame, blocks_wide: pl.DataFrame | None = None) -> 
     prices_hr = aggregate_per_tx_hourly(blocks, p51_pb, p60_prices)
     x_price60 = _hours_x(prices_hr)
     p60_hr    = prices_hr["p60_gwei"].to_numpy()
-    pk_hr     = {k: prices_hr[f"p_{k}_gwei"].to_numpy() for k in PRICED_SYMBOLS}
+    pk_hr     = {k: prices_hr[f"p_{k}_gwei"].to_numpy() for k in GAS_RESOURCES}
     rev_60_eth = prices_hr["_p60_fee"].to_numpy() / 1e9
 
     # Wide-window block-level aggregation (Oct→Apr) for the Real + ArbOS 51
@@ -863,7 +868,7 @@ def build_fig(blocks: pl.DataFrame, blocks_wide: pl.DataFrame | None = None) -> 
     # ── Penultimate panel: per-resource ArbOS 60 prices p_k ────────────────
     pk_row = n_panels - 2
     pk_max = P_MIN_GWEI
-    for k in PRICED_SYMBOLS:
+    for k in GAS_RESOURCES:
         y = pk_hr[k]
         # Hours with zero gas for this resource → NaN; replace with floor so
         # the line stays visible at P_min instead of breaking.
@@ -873,10 +878,10 @@ def build_fig(blocks: pl.DataFrame, blocks_wide: pl.DataFrame | None = None) -> 
             go.Scatter(
                 x=x_price60, y=y,
                 mode="lines",
-                name=f"p_{k} — {PRICED_SYMBOL_LABELS[k]}",
-                line=dict(color=PRICED_SYMBOL_COLORS[k], width=1.6),
+                name=f"p_{k} — {GAS_RESOURCE_LABELS[k]}",
+                line=dict(color=GAS_RESOURCE_COLORS[k], width=1.6),
                 hovertemplate=(
-                    f"p_{k} ({PRICED_SYMBOL_LABELS[k]}): "
+                    f"p_{k} ({GAS_RESOURCE_LABELS[k]}): "
                     f"%{{y:.4f}} gwei<extra></extra>"
                 ),
                 legendgroup="pk",

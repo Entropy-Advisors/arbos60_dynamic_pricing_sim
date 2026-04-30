@@ -2,20 +2,34 @@
 ArbOS 51 dynamic-pricing equations.
 
 Single-dimensional 6-constraint geometric ladder. One base fee per block,
-applied uniformly to every gas unit. Backlog evolves at **1-second** ticks
-per the proposal spec ("every second, add inflow, remove T"); per-block
-backlog is a lookup of the per-second time series. Blocks within the same
-wall-clock second therefore share the same backlog and the same price.
+applied uniformly to every gas unit. ArbOS 51 has only one set i, so the
+i-index is suppressed; only j (constraint within the ladder) varies.
+Backlog evolves at Δt = 1 s ticks per the proposal spec ("every second,
+add inflow, remove T"); per-block backlog is a lookup of the per-t time
+series. Blocks within the same wall-clock t therefore share the same
+backlog and the same price.
 
-Public surface — the `Arbos51GasPricing` class. Method order mirrors the
-equation flow:
+    backlog (Δt = 1 s tick, per j):
+        B_j(t+1) = max(0, B_j(t) + g_total(t) − T_j · Δt)
+
+    raw exponent (per t):
+        E(t) = Σ_j B_j(t) / (A_j · T_j)
+
+    base fee (per t):
+        p(t) = p_min · taylor4_exp(max(0, E(t)))
+
+    per-tx fee:
+        fee_tx = p(block_of_tx) · g_total_tx
+
+Public surface — `Arbos51GasPricing`. Method order mirrors the equation flow:
 
     1. Constants                (P_min, ladder)
     2. Time / aggregation       (block_seconds_utc, aggregate_per_second)
-    3. Pure exp approximation   (taylor4_exp)
-    4. Backlog                  (backlog_per_second)
-    5. Per-second price         (price_per_second)
-    6. Per-tx pricing           (price_per_tx, fee_per_tx)
+    3. Exp approximation        (taylor4_exp)
+    4. Inflow per t             (compute_inflow_per_t)
+    5. Backlog                  (backlog_per_second)
+    6. Per-t price              (price_per_second)
+    7. Per-tx pricing           (price_per_tx, fee_per_tx)
 """
 
 from __future__ import annotations
@@ -73,36 +87,36 @@ class Arbos51GasPricing:
     # ── 2. Time / aggregation helpers ───────────────────────────────────────
     @staticmethod
     def block_seconds_utc(block_times_utc: np.ndarray) -> np.ndarray:
-        """Per-block integer-second UTC timestamps."""
+        """Per-block integer-second UTC timestamps (= per-block t)."""
         return block_times_utc.astype("datetime64[s]").astype(np.int64)
 
     @staticmethod
     def aggregate_per_second(
         values_per_block: np.ndarray,
-        block_seconds: np.ndarray,
+        block_t: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Sum per-block values into per-second buckets over the contiguous
-        second range covered by `block_seconds`. Empty seconds (no blocks
-        landed) contribute 0 to the inflow but still drain the backlog —
-        critical for the backlog loop downstream.
+        """Sum per-block values into per-t buckets over the contiguous
+        t range covered by `block_t`.  Empty seconds (no blocks landed)
+        contribute 0 to the inflow but still drain the backlog — required
+        for the backlog recursion downstream to be correct.
 
-        Assumes `block_seconds` is sorted ascending: `block_seconds[0]` is
-        used as the window start and `block_seconds[-1]` as the end.
+        Assumes `block_t` is sorted ascending: `block_t[0]` is the window
+        start and `block_t[-1]` the end.
 
-        Returns (seconds_axis, sum_per_second). seconds_axis is dense int64
-        from min..max of `block_seconds`, inclusive.
+        Returns (t_axis, sum_per_t).  t_axis is dense int64 from
+        min..max(block_t), inclusive.
         """
-        s_min     = int(block_seconds[0])
-        s_max     = int(block_seconds[-1])
-        n_seconds = s_max - s_min + 1
-        seconds   = np.arange(s_min, s_max + 1, dtype=np.int64)
-        idx       = (block_seconds - s_min).astype(np.int64)
-        summed    = np.bincount(
-            idx,
+        t_min  = int(block_t[0])                                # window start (UTC s)
+        t_max  = int(block_t[-1])                               # window end   (UTC s)
+        n_t    = t_max - t_min + 1                              # # of 1 s buckets
+        t_axis = np.arange(t_min, t_max + 1, dtype=np.int64)    # dense t axis
+        t_idx  = (block_t - t_min).astype(np.int64)             # bucket index per block
+        summed = np.bincount(                                   # Σ values_per_block per bucket
+            t_idx,
             weights=np.asarray(values_per_block, dtype=np.float64),
-            minlength=n_seconds,
+            minlength=n_t,                                      # pads empty seconds with 0
         )
-        return seconds, summed
+        return t_axis, summed
 
     # ── 3. Exp approximation (matches Nitro `model.go`) ─────────────────────
     @staticmethod
@@ -115,83 +129,124 @@ class Arbos51GasPricing:
         x4 = x2 * x2
         return 1.0 + x + x2 / 2.0 + x3 / 6.0 + x4 / 24.0
 
-    # ── 4. Backlog (1-s tick loop) ──────────────────────────────────────────
+    # ── 4. Inflow per t (single-set: just g_total aggregated) ──────────────
+    def compute_inflow_per_t(
+        self,
+        total_gas: np.ndarray,
+        block_t: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Per-t inflow for ArbOS 51's single set: aggregate the per-block
+        total L2 gas to per-t (1 s buckets).  Returns (t_axis, inflow_per_t).
+        Counterpart to ArbOS 60's `compute_inflow_per_t`, simplified because
+        there is no resource weighting (one set, single dimension).
+        """
+        return self.aggregate_per_second(total_gas, block_t)
+
+    # ── 5. Backlog (1-s tick loop) ──────────────────────────────────────────
     @staticmethod
     def backlog_per_second(
-        inflow_per_second: np.ndarray,
-        T_arr: np.ndarray,
+        inflow_per_t: np.ndarray,   # = g_total(t), per t (single set)
+        T_j: np.ndarray,            # T_j ladder for the constraints
     ) -> np.ndarray:
-        """Start-of-each-second backlog seen by blocks landing in that
-        second. `T_arr` is the 1-D ladder (Mgas/s); returns shape
-        (n_T, n_sec).
+        """Backlog tick, vectorised over j:
+            B_j(t+1) = max(0, B_j(t) + inflow(t) − T_j·Δt)
 
-            B(0) = 0;   B(s+1) = max(0, B(s) + inflow(s) - T*1).
-
-        out[:, s] is recorded *before* second s's update — that's what a
-        block in second s reads, before that second's inflow / drain.
+        `inflow_per_t` is supplied by compute_inflow_per_t.  Returns
+        (n_j, n_t); out[j, t] is the start-of-t backlog (pre-update),
+        which is what a block landing in t reads.
         """
-        drain = T_arr * 1e6                                       # Mgas/s -> gas/s
-        out = np.empty((T_arr.shape[0], inflow_per_second.shape[0]))
-        B   = np.zeros(T_arr.shape[0])
-        for s, inflow_s in enumerate(inflow_per_second):
-            out[:, s] = B                                         # snapshot before update
-            B = np.maximum(0.0, B + inflow_s - drain)
+        drain = T_j * 1e6                                         # Mgas/s → gas/s (one number per j)
+        out   = np.empty((T_j.shape[0], inflow_per_t.shape[0]))   # output buffer (n_j, n_t)
+        B_j   = np.zeros(T_j.shape[0])                            # B_j(0) = 0  for every j
+        for t, inflow_t in enumerate(inflow_per_t):               # walk t = 0, 1, … n_t-1
+            out[:, t] = B_j                                       # snapshot B_j(t) before update
+            B_j = np.maximum(0.0, B_j + inflow_t - drain)         # advance to B_j(t+1)
         return out
 
-    # ── 5. Per-second price ─────────────────────────────────────────────────
+    # ── 6. Per-t price ──────────────────────────────────────────────────────
     def price_per_second(
         self,
         total_gas: np.ndarray,
-        block_seconds: np.ndarray,
+        block_t: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Per-second ArbOS 51 base fee in gwei.
+        """Per-t ArbOS 51 base fee in gwei:
 
-            E(s) = Σ_j  B_j(s) / (A_j · T_j)
-            p(s) = p_min · taylor4_exp(max(0, E(s)))
+            E(t) = Σ_j  B_j(t) / (A_j · T_j)
+            p(t) = p_min · taylor4_exp(max(0, E(t)))
 
-        Returns (seconds_axis, p_per_sec). To gather to per-block:
-            sec_idx = (block_seconds - seconds_axis[0]).astype(np.int64)
-            p_per_block = p_per_sec[sec_idx]
+        Returns (t_axis, p_per_t).  Caller gathers to per-block via:
+            t_idx       = (block_t - t_axis[0]).astype(np.int64)
+            p_per_block = p_per_t[t_idx]
         """
-        seconds_axis, inflow_ps = self.aggregate_per_second(total_gas, block_seconds)
-        T_arr = np.array([T for T, _ in self.ladder], dtype=np.float64)
-        A_arr = np.array([A for _, A in self.ladder], dtype=np.float64)
-        B = self.backlog_per_second(inflow_ps, T_arr)             # (n_T, n_sec)
-        E = (B / (A_arr * T_arr * 1e6)[:, None]).sum(axis=0)      # (n_sec,)
-        p_per_sec = self.p_min_gwei * self.taylor4_exp(np.maximum(E, 0.0))
-        return seconds_axis, p_per_sec
+        # ── Step 4 ─────────────────────────────────────────────────────────
+        # Inflow on the dense t axis: just g_total aggregated to 1 s buckets
+        # (single set, no resource weighting).
+        t_axis, inflow_per_t = self.compute_inflow_per_t(total_gas, block_t)
+
+        # Pull the j-indexed (T_j, A_j) ladder pairs.
+        T_j = np.array([T for T, _ in self.ladder], dtype=np.float64)
+        A_j = np.array([A for _, A in self.ladder], dtype=np.float64)
+
+        # ── Step 5 ─────────────────────────────────────────────────────────
+        # Backlog tick → B_j(t), shape (n_j, n_t).
+        B_j = self.backlog_per_second(inflow_per_t, T_j)
+
+        # ── Step 6 ─────────────────────────────────────────────────────────
+        # E(t) = Σ_j B_j(t) / (A_j · T_j).  T_j*1e6 puts the denominator in
+        # gas/s so it matches the gas-units backlog; broadcast over t, then
+        # fold over j → shape (n_t,).
+        E = (B_j / (A_j * T_j * 1e6)[:, None]).sum(axis=0)
+
+        # p(t) = p_min · taylor4_exp(max(0, E(t))).  taylor4_exp(0) = 1
+        # and the function is monotone on [0, ∞), so the p_min floor holds.
+        p_per_t = self.p_min_gwei * self.taylor4_exp(np.maximum(E, 0.0))
+        return t_axis, p_per_t
 
     @classmethod
     def historical_price_per_second(
         cls,
         total_gas: np.ndarray,
-        block_seconds: np.ndarray,
+        block_t: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Per-second price honoring the ArbOS 51 Dia activation boundary.
+        """Per-t price honoring the ArbOS 51 Dia activation boundary.
 
-        Blocks with `block_seconds < ARBOS_DIA_ACTIVATION_S` are priced with
-        the pre-Dia engine (single constraint, p_min = 0.01 gwei); blocks at
-        or after activation use the Dia engine (6-rung ladder, p_min = 0.02
-        gwei). Backlogs warm up independently per regime — matches the
+        Blocks with `block_t < ARBOS_DIA_ACTIVATION_S` are priced with the
+        pre-Dia engine (single constraint, p_min = 0.01 gwei); blocks at or
+        after activation use the Dia engine (6-rung ladder, p_min = 0.02
+        gwei).  Backlogs warm up independently per regime — matches the
         on-chain reset at the upgrade.
 
-        Returns (seconds_axis, p_per_sec) covering the union of both regimes
-        in chronological order. Assumes `block_seconds` is sorted ascending.
+        Returns (t_axis, p_per_t) covering the union of both regimes in
+        chronological order.  Assumes `block_t` is sorted ascending.
         """
-        n = block_seconds.shape[0]
-        if n == 0:
+        n = block_t.shape[0]
+        if n == 0:                                                # nothing to price
             empty = np.zeros(0, dtype=np.int64)
             return empty, np.zeros(0, dtype=np.float64)
-        split = int(np.searchsorted(block_seconds, ARBOS_DIA_ACTIVATION_S, side="left"))
-        if split == 0:
-            return cls().price_per_second(total_gas, block_seconds)
-        if split == n:
-            return cls.pre_dia().price_per_second(total_gas, block_seconds)
-        s_pre, p_pre = cls.pre_dia().price_per_second(total_gas[:split], block_seconds[:split])
-        s_dia, p_dia = cls().price_per_second(total_gas[split:], block_seconds[split:])
-        return np.concatenate([s_pre, s_dia]), np.concatenate([p_pre, p_dia])
 
-    # ── 6. Per-tx pricing ───────────────────────────────────────────────────
+        # Find the index where block_t crosses the Dia activation second.
+        # `side="left"` puts ties at activation into the Dia regime — matches
+        # the on-chain rule that activation block t belongs to Dia.
+        split = int(np.searchsorted(block_t, ARBOS_DIA_ACTIVATION_S, side="left"))
+
+        # All blocks already at/after activation → pure Dia run, no split needed.
+        if split == 0:
+            return cls().price_per_second(total_gas, block_t)
+        # All blocks before activation → pure pre-Dia run.
+        if split == n:
+            return cls.pre_dia().price_per_second(total_gas, block_t)
+
+        # Mixed window: run each regime on its own slice with its own backlog
+        # state (B_j(0) = 0 reset at the upgrade boundary, matching the
+        # on-chain reset).  Then concatenate the two output slices.
+        t_pre, p_pre = cls.pre_dia().price_per_second(total_gas[:split], block_t[:split])
+        t_dia, p_dia = cls()        .price_per_second(total_gas[split:], block_t[split:])
+        return (
+            np.concatenate([t_pre, t_dia]),     # t axis: pre-Dia then Dia (chronological)
+            np.concatenate([p_pre, p_dia]),     # p(t): same order
+        )
+
+    # ── 7. Per-tx pricing ───────────────────────────────────────────────────
     @staticmethod
     def price_per_tx(
         p_per_block: np.ndarray,
@@ -207,6 +262,5 @@ class Arbos51GasPricing:
         tx_block_idx: np.ndarray,
         tx_total_gas: np.ndarray,
     ) -> np.ndarray:
-        """Per-tx fee in gwei·gas:  fee_tx = p_block(of tx) · g_tx_total"""
+        """Per-tx fee (gwei·gas):  fee_tx = p(block_of_tx) · g_total_tx."""
         return p_per_block[tx_block_idx] * tx_total_gas
-

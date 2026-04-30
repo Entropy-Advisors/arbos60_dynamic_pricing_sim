@@ -7,11 +7,11 @@ machinery as ArbOS 51, but wrapped with per-set inflows and a max-over-sets
 projection that yields one price per resource. Backlog evolves at 1-second
 ticks; per-block backlog is a lookup of the per-second time series.
 
-    backlog (1-s tick, per (i, j)):
-        B_{i,j}(s+1) = max(0, B_{i,j}(s) + Σ_k a_{i,k}·g_k(s) - T_{i,j}·1)
+    backlog (Δt = 1 s tick, per (i, j)):
+        B_{i,j}(t+1) = max(0, B_{i,j}(t) + Σ_k a_{i,k}·g_k(t) - T_{i,j}·Δt)
 
     set i raw exponent (per block, via start-of-second lookup):
-        E_i = Σ_j B_{i,j} / (A_{i,j}·T_{i,j})
+        E_i(t) = Σ_j B_{i,j}(t) / (A_{i,j}·T_{i,j})
 
     per-resource price:
         p_k = p_min · exp(max_i { a_{i,k} · E_i })
@@ -25,15 +25,16 @@ ticks; per-block backlog is a lookup of the per-second time series.
 Public surface — the `Arbos60GasPricing` class. Method order mirrors the
 equation flow:
 
-    1. Constants                (P_min)
-    2. Constraint sets          (SET_WEIGHTS_1/2, SET_LADDERS_1/2, PRICED_SYMBOLS)
-    3. Time / aggregation       (block_seconds_utc, aggregate_per_second)
-    4. Exp approximation        (taylor4_exp)
-    5. Resource gas builders    (per_block_resource_gas, per_tx_resource_split)
-    6. Backlog                  (backlog_per_second)
-    7. Per-set raw exponent     (compute_set_exponents)
-    8. Per-resource prices      (price_per_resource)
-    9. Per-tx pricing           (fee_per_tx)
+    1.  Constants               (P_min)
+    2.  Constraint sets         (SET_WEIGHTS_1/2, SET_LADDERS_1/2, GAS_RESOURCES)
+    3.  Time / aggregation      (block_seconds_utc, aggregate_per_second)
+    4.  Exp approximation       (taylor4_exp)
+    5.  Resource gas builders   (per_block_resource_gas, per_tx_resource_split)
+    6.  Per-set inflow per t    (compute_inflow_per_t)
+    7.  Backlog                 (backlog_per_second)
+    8.  Per-set raw exponent    (compute_set_exponents)
+    9.  Per-resource prices     (price_per_resource)
+    10. Per-tx pricing          (fee_per_tx)
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ class Arbos60GasPricing:
 
     # ── 2. Constraint sets — proposal definitions ──────────────────────────
     # Weights and ladders below come from the ArbOS 60 proposal; the same
-    # tables are reproduced in docs/arbos51_vs_arbos60_equations.md.
+    # tables are reproduced in docs/arbos51_vs_arbos60_equations.md
     #
     # Each set is a weighted inequality Σ_k a_{i,k}·g_k ≤ T_{i,j}.
     # Symbols:
@@ -107,8 +108,8 @@ class Arbos60GasPricing:
     }
 
     # 6 priced resources. Order = dimension index k for p_k.
-    PRICED_SYMBOLS: list[str] = ["c", "sw", "sr", "sg", "hg", "l2"]
-    PRICED_SYMBOL_LABELS: dict[str, str] = {
+    GAS_RESOURCES: list[str] = ["c", "sw", "sr", "sg", "hg", "l2"]
+    GAS_RESOURCE_LABELS: dict[str, str] = {
         "c":  "Computation",
         "sw": "Storage Write",
         "sr": "Storage Read",
@@ -145,25 +146,26 @@ class Arbos60GasPricing:
     @staticmethod
     def aggregate_per_second(
         values_per_block: np.ndarray,
-        block_seconds: np.ndarray,
+        block_t: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Sum per-block values into per-second buckets, dense from min..max
-        of `block_seconds`. Empty seconds (no blocks landed) contribute 0
-        to inflow but still drain backlog downstream — required for the
-        backlog loop downstream to be correct.
+        """Sum per-block values into per-t (1 s) buckets, dense from
+        min..max of `block_t`.  Empty seconds (no blocks landed) carry 0
+        inflow but still drain backlog downstream — required for the
+        backlog tick to be correct.
 
-        Assumes `block_seconds` is sorted ascending."""
-        s_min     = int(block_seconds[0])
-        s_max     = int(block_seconds[-1])
-        n_seconds = s_max - s_min + 1
-        seconds   = np.arange(s_min, s_max + 1, dtype=np.int64)
-        idx       = (block_seconds - s_min).astype(np.int64)
-        summed    = np.bincount(
-            idx,
+        Assumes `block_t` is sorted ascending."""
+        t_min  = int(block_t[0])                                # window start (UTC s)
+        t_max  = int(block_t[-1])                               # window end   (UTC s)
+        n_t    = t_max - t_min + 1                              # # of 1 s buckets
+        t_axis = np.arange(t_min, t_max + 1, dtype=np.int64)    # dense t axis
+        t_idx  = (block_t - t_min).astype(np.int64)             # bucket index per block
+        summed = np.bincount(                                   # Σ values_per_block in each bucket
+            t_idx,
             weights=np.asarray(values_per_block, dtype=np.float64),
-            minlength=n_seconds,
+            minlength=n_t,                                       # pads empty seconds with 0
         )
-        return seconds, summed
+        return t_axis, summed
+
 
     # ── 4. Exp approximation ────────────────────────────────────────────────
     @staticmethod
@@ -221,88 +223,135 @@ class Arbos60GasPricing:
             "l2": l2_calldata,
         }
 
-    # ── 6. Backlog (1-s tick loop) ──────────────────────────────────────────
+    # ── 6. Per-set inflow (Σ_k a_{i,k} · g_k aggregated to t) ───────────────
+    def compute_inflow_per_t(
+        self,
+        g_per_block: dict[str, np.ndarray],
+        a_i: dict[str, float],
+        block_t: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Per-t weighted inflow for one set i:
+            inflow_i(t) = Σ_k a_{i,k} · g_k(t)
+
+        Each priced resource k contributes its per-block gas weighted by
+        a_{i,k}; the weighted sum is aggregated from per-block to per-t
+        (1 s buckets) so it can be fed into the backlog tick.
+
+        Returns (t_axis, inflow_i_per_t).  Empty seconds in the window
+        contribute 0 inflow but still drain B_{i,j} downstream, required
+        for the backlog recursion to be correct.
+        """
+        # Pull n_blocks from any one of the resource arrays — they share length
+        n_blocks = next(iter(g_per_block.values())).shape[0]
+        # Running per-block accumulator for Σ_k a_{i,k} · g_k.
+        inflow_i_per_block = np.zeros(n_blocks, dtype=np.float64)
+        # Walk the (resource → weight) entries of set i; missing keys mean
+        # a_{i,k} = 0, so they're naturally skipped by the dict iteration
+        for k, a_ik in a_i.items():
+            inflow_i_per_block += a_ik * g_per_block[k]              # add a_{i,k} · g_k
+        # Per-block → per-t aggregation (1 s buckets, dense over window)
+        return self.aggregate_per_second(inflow_i_per_block, block_t)
+
+    # ── 7. Backlog (1-s tick loop) ──────────────────────────────────────────
     @staticmethod
     def backlog_per_second(
-        inflow_per_second: np.ndarray,
-        T_arr: np.ndarray,
+        inflow_i_per_t: np.ndarray,   # = Σ_k a_{i,k}·g_k(t), per t (one set i)
+        T_i: np.ndarray,              # T_{i,j} ladder for the set i's constraints
     ) -> np.ndarray:
-        """Start-of-each-second backlog seen by blocks landing in that
-        second. `T_arr` is the 1-D ladder (Mgas/s); returns (n_T, n_sec).
+        """Backlog tick for one set i, vectorised over j:
+            B_{i,j}(t+1) = max(0, B_{i,j}(t) + inflow_i(t) − T_{i,j}·Δt)
 
-            B(0) = 0;   B(s+1) = max(0, B(s) + inflow(s) - T*1).
-
-        out[:, s] is recorded *before* second s's update — that's what a
-        block in second s reads, before that second's inflow / drain.
+        `inflow_i_per_t` is supplied by compute_inflow_per_t.  Returns
+        (n_j, n_t); out[j, t] is the start-of-t backlog (pre-update),
+        which is what a block landing in t reads.
         """
-        drain = T_arr * 1e6                                       # Mgas/s -> gas/s
-        out = np.empty((T_arr.shape[0], inflow_per_second.shape[0]))
-        B   = np.zeros(T_arr.shape[0])
-        for s, inflow_s in enumerate(inflow_per_second):
-            out[:, s] = B
-            B = np.maximum(0.0, B + inflow_s - drain)
+        drain = T_i * 1e6                                       # Mgas/s -> gas/s
+        out = np.empty((T_i.shape[0], inflow_i_per_t.shape[0]))
+        B_ij = np.zeros(T_i.shape[0])                           # B_{i,j}(0) = 0
+        for t, inflow_i_t in enumerate(inflow_i_per_t):
+            out[:, t] = B_ij                                    # snapshot B_{i,j}(t)
+            B_ij = np.maximum(0.0, B_ij + inflow_i_t - drain)   # → B_{i,j}(t+1)
         return out
 
-    # ── 7. Per-set raw exponent ─────────────────────────────────────────────
+    # ── 8. Per-set raw exponent ─────────────────────────────────────────────
     def compute_set_exponents(
         self,
-        parts: dict[str, np.ndarray],
-        block_seconds: np.ndarray,
+        g_per_block: dict[str, np.ndarray],
+        block_t: np.ndarray,
     ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-        """E_i(s) = Σ_j B_{i,j}(s) / (A_{i,j}·T_{i,j}) — per second, per set.
+        """E_i(t) = Σ_j B_{i,j}(t) / (A_{i,j}·T_{i,j})   for each set i.
 
-        Returns (seconds_axis, {set_name → E_i (n_sec,)}).
+        Indices:
+            i = set of constraints
+            j = constraint within set i  (rung of the ladder)
+            k = resource  (6 priced resources in GAS_RESOURCES)
+
+        `g_per_block` maps k → g_k(per block).  `block_t` is the per-block
+        wall-clock t (UTC seconds since epoch).  Returns
+        (t_axis, {set_name → E_i, shape (n_t,)}).
         """
-        n = next(iter(parts.values())).shape[0]
         E_per_set: dict[str, np.ndarray] = {}
-        seconds_ref = np.empty(0, dtype=np.int64)
-        for set_name, weights in self.set_weights.items():
-            inflow_pb = np.zeros(n, dtype=np.float64)
-            for sym, w in weights.items():
-                inflow_pb = inflow_pb + w * parts[sym]
-            seconds_ref, inflow_ps = self.aggregate_per_second(inflow_pb, block_seconds)
+        t_axis = np.empty(0, dtype=np.int64)  # shared across sets (overwritten in-loop)
+        for set_name, a_i in self.set_weights.items():  # iterate sets i
+            # Step 6: build inflow_i(t) = Σ_k a_{i,k}·g_k(t) on the dense t axis
+            t_axis, inflow_i_per_t = self.compute_inflow_per_t(
+                g_per_block, a_i, block_t,
+            )
+            # Pull the j-indexed (T_{i,j}, A_{i,j}) pairs for this set.
             ladder = self.set_ladders[set_name]
-            T_arr  = np.array([T for T, _ in ladder], dtype=np.float64)
-            A_arr  = np.array([A for _, A in ladder], dtype=np.float64)
-            B      = self.backlog_per_second(inflow_ps, T_arr)
-            E_per_set[set_name] = (B / (A_arr * T_arr * 1e6)[:, None]).sum(axis=0)
-        return seconds_ref, E_per_set
+            T_i = np.array([T for T, _ in ladder], dtype=np.float64)  # T_{i,j}, j = 0..n_j-1
+            A_i = np.array([A for _, A in ladder], dtype=np.float64)  # A_{i,j}, j = 0..n_j-1
+            # Step 7: backlog tick → B_{i,j}(t), shape (n_j, n_t).
+            B_i = self.backlog_per_second(inflow_i_per_t, T_i)
+            # E_i(t) = Σ_j B_{i,j}(t) / (A_{i,j} · T_{i,j}).  T_i*1e6 puts the
+            # denominator in gas/s so it matches the gas-units backlog
+            E_per_set[set_name] = (
+                B_i / (A_i * T_i * 1e6)[:, None]  # broadcast over t
+            ).sum(axis=0)   # fold over j → (n_t,)
+        return t_axis, E_per_set
 
-    # ── 8. Per-resource prices (max-over-sets) ─────────────────────────────
+    # ── 9. Per-resource prices (max-over-sets) ─────────────────────────────
     def price_per_resource(
         self,
-        parts: dict[str, np.ndarray],
-        block_seconds: np.ndarray,
+        g_per_block: dict[str, np.ndarray],
+        block_t: np.ndarray,
     ) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray]]:
-        """Per-second ArbOS 60 prices (one per priced resource symbol).
+        """Per-t ArbOS 60 prices (one per priced resource k).
 
-            e_k(s) = max_i { a_{i,k} · E_i(s) }   (only the binding set lifts p_k)
-            p_k(s) = p_min · taylor4_exp(max(0, e_k(s)))
+            e_k(t) = max_i { a_{i,k} · E_i(t) }
+            p_k(t) = p_min · taylor4_exp(max(0, e_k(t)))
 
-        Returns (seconds_axis, prices, E_per_set), all per-second.
+        Indices: i = set, k = resource (∈ GAS_RESOURCES).
+        Returns (t_axis, prices, E_per_set), all per-t.
         Caller gathers to per-block / per-tx via:
-            sec_idx = (block_seconds - seconds_axis[0]).astype(np.int64)
-            prices_per_block = {k: prices[k][sec_idx] for k in PRICED_SYMBOLS}
+            t_idx            = (block_t - t_axis[0]).astype(np.int64)
+            prices_per_block = {k: prices[k][t_idx] for k in GAS_RESOURCES}
         """
-        seconds_axis, E_per_set = self.compute_set_exponents(parts, block_seconds)
-        n_sec = next(iter(E_per_set.values())).shape[0]
+        # ── Step 1 ─────────────────────────────────────────────────────────
+        # E_i(t) = Σ_j B_{i,j}(t) / (A_{i,j}·T_{i,j})  for every set i.
+        t_axis, E_per_set = self.compute_set_exponents(g_per_block, block_t)
+        n_t = len(t_axis)
 
+        # ── Step 2 ─────────────────────────────────────────────────────────
+        # For each resource k, project: e_k(t) = max_i { a_{i,k} · E_i(t) }.
+        # Sets with a_{i,k}=0 can't lift the max, so we skip them.
         prices: dict[str, np.ndarray] = {}
-        for k in self.PRICED_SYMBOLS:
-            # Walk the sets and take the max of a_{i,k}·E_i over those that
-            # actually weight resource k (a_{i,k} > 0). Sets with a_{i,k}=0
-            # contribute nothing to this resource's price by construction.
-            e_k = np.zeros(n_sec, dtype=np.float64)
-            for set_name, weights in self.set_weights.items():
-                a_ik = float(weights.get(k, 0.0))
+        for k in self.GAS_RESOURCES:
+            e_k = np.zeros(n_t, dtype=np.float64)               # init max with 0
+            for set_name, a_i in self.set_weights.items():
+                a_ik = float(a_i.get(k, 0.0))                   # weight a_{i,k}
                 if a_ik == 0.0:
                     continue
+                # candidate term  a_{i,k} · E_i(t)  for this (i, k)
                 e_k = np.maximum(e_k, a_ik * E_per_set[set_name])
+
+            # ── Step 3 ─────────────────────────────────────────────────────
+            # p_k(t) = p_min · taylor4_exp(max(0, e_k(t)))
             prices[k] = self.p_min_gwei * self.taylor4_exp(np.maximum(e_k, 0.0))
 
-        return seconds_axis, prices, E_per_set
+        return t_axis, prices, E_per_set
 
-    # ── 9. Per-tx fee (vectorised over txs) ─────────────────────────────────
+    # ── 10. Per-tx fee (vectorised over txs) ────────────────────────────────
     def fee_per_tx(
         self,
         p_per_resource: dict[str, np.ndarray],
@@ -310,13 +359,11 @@ class Arbos60GasPricing:
         tx_g_per_resource: dict[str, np.ndarray],
     ) -> np.ndarray:
         """Per-tx fee (gwei·gas) under ArbOS 60 per-resource pricing:
-            fee_tx = Σ_k g_tx,k · p_k(block_of_tx)
 
-        No separate per-gas `price_per_tx`: under ArbOS 60 each resource has
-        its own price, so the natural object is the inner product above."""
+            fee_tx = Σ_k g_tx,k · p_k(block_of_tx)"""
         n_tx = tx_block_idx.shape[0]
         fee = np.zeros(n_tx, dtype=np.float64)
-        for k in self.PRICED_SYMBOLS:
+        for k in self.GAS_RESOURCES:
             fee = fee + tx_g_per_resource[k] * p_per_resource[k][tx_block_idx]
         return fee
 
