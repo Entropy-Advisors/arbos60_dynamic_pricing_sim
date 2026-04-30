@@ -14,5 +14,6 @@ data/
 .env
 
 # Local-only planning notes — keep on disk, off the remote.
-docs/simulation_plan.md
-docs/demand_elasticity_plan.md
+# Only the equations reference is tracked.
+docs/*.md
+!docs/arbos51_vs_arbos60_equations.md
