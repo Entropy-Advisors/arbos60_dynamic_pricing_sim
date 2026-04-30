@@ -172,7 +172,7 @@ class Arbos51GasPricing:
         """Per-t ArbOS 51 base fee in gwei:
 
             E(t) = Σ_j  B_j(t) / (A_j · T_j)
-            p(t) = p_min · taylor4_exp(max(0, E(t)))
+            p(t) = p_min · taylor4_exp(E(t))
 
         Returns (t_axis, p_per_t).  Caller gathers to per-block via:
             t_idx       = (block_t - t_axis[0]).astype(np.int64)
@@ -197,9 +197,10 @@ class Arbos51GasPricing:
         # fold over j → shape (n_t,).
         E = (B_j / (A_j * T_j * 1e6)[:, None]).sum(axis=0)
 
-        # p(t) = p_min · taylor4_exp(max(0, E(t))).  taylor4_exp(0) = 1
-        # and the function is monotone on [0, ∞), so the p_min floor holds.
-        p_per_t = self.p_min_gwei * self.taylor4_exp(np.maximum(E, 0.0))
+        # p(t) = p_min · taylor4_exp(E(t)).  E(t) ≥ 0 by construction
+        # (B, A, T all non-negative), so no max(0, …) clip is needed.
+        # taylor4_exp(0) = 1, monotone on [0, ∞), so p ≥ p_min always.
+        p_per_t = self.p_min_gwei * self.taylor4_exp(E)
         return t_axis, p_per_t
 
     @classmethod

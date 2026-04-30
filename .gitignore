@@ -12,3 +12,7 @@ data/
 
 # Local credentials (Dune / ClickHouse). Never commit.
 .env
+
+# Local-only planning notes — keep on disk, off the remote.
+docs/simulation_plan.md
+docs/demand_elasticity_plan.md

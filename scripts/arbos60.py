@@ -212,8 +212,7 @@ class Arbos60GasPricing:
         l2_calldata: np.ndarray,
     ) -> dict[str, np.ndarray]:
         """Build the per-tx 6-resource gas dict expected by `fee_per_tx`
-        from raw multigas columns. l1Calldata is NOT included here — ArbOS
-        60 prices it separately via the L1 fee mechanism."""
+        from raw multigas columns. l1Calldata is not included."""
         return {
             "c":  computation + wasm_computation,
             "sw": storage_access_write,
@@ -319,7 +318,7 @@ class Arbos60GasPricing:
         """Per-t ArbOS 60 prices (one per priced resource k).
 
             e_k(t) = max_i { a_{i,k} · E_i(t) }
-            p_k(t) = p_min · taylor4_exp(max(0, e_k(t)))
+            p_k(t) = p_min · taylor4_exp(e_k(t))
 
         Indices: i = set, k = resource (∈ GAS_RESOURCES).
         Returns (t_axis, prices, E_per_set), all per-t.
@@ -333,21 +332,28 @@ class Arbos60GasPricing:
         n_t = len(t_axis)
 
         # ── Step 2 ─────────────────────────────────────────────────────────
-        # For each resource k, project: e_k(t) = max_i { a_{i,k} · E_i(t) }.
-        # Sets with a_{i,k}=0 can't lift the max, so we skip them.
+        # For each resource k, the spec says
+        #     e_k(t) = max_i { a_{i,k} · E_i(t) }                       (eq. 1)
+        # i.e. take the *maximum over sets i* of the resource-weighted
+        # exponent.  Implemented as a running np.maximum over the i loop:
+        # `e_k` accumulates the largest a_{i,k}·E_i seen so far.
+        # Sets with a_{i,k}=0 cannot lift the max (they contribute 0), so
+        # we skip them as an optimisation — semantically equivalent.
         prices: dict[str, np.ndarray] = {}
         for k in self.GAS_RESOURCES:
-            e_k = np.zeros(n_t, dtype=np.float64)               # init max with 0
-            for set_name, a_i in self.set_weights.items():
+            e_k = np.zeros(n_t, dtype=np.float64)               # max-over-i, init at 0
+            for set_name, a_i in self.set_weights.items():      # iterate sets i
                 a_ik = float(a_i.get(k, 0.0))                   # weight a_{i,k}
                 if a_ik == 0.0:
-                    continue
-                # candidate term  a_{i,k} · E_i(t)  for this (i, k)
-                e_k = np.maximum(e_k, a_ik * E_per_set[set_name])
+                    continue                                    # a_{i,k}=0 -> can't be the max
+                candidate = a_ik * E_per_set[set_name]          # a_{i,k} · E_i(t)
+                e_k = np.maximum(e_k, candidate)                # max over sets i
 
             # ── Step 3 ─────────────────────────────────────────────────────
-            # p_k(t) = p_min · taylor4_exp(max(0, e_k(t)))
-            prices[k] = self.p_min_gwei * self.taylor4_exp(np.maximum(e_k, 0.0))
+            # p_k(t) = p_min · taylor4_exp(e_k(t)).
+            # No max(0, …) clip needed: e_k ≥ 0 by construction (B, A, T,
+            # a are all non-negative; max is initialised at 0).
+            prices[k] = self.p_min_gwei * self.taylor4_exp(e_k)
 
         return t_axis, prices, E_per_set
 
