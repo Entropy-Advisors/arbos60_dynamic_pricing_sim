@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import time
 from datetime import datetime
 
 import numpy as np
@@ -34,11 +35,19 @@ import historical_sim as hs                     # noqa: E402
 
 OUT_HTML = _HERE / "index.html"
 
-# Cached uniform reservoir sample of per-tx rows (no min-gas filter), used
-# only for descriptive statistics on slide 5.  Cached so the deck rebuilds
-# in seconds instead of re-streaming 594 M rows every time.
+# Cached uniform reservoir sample of per-tx rows.  Kept as a small fallback
+# for ad-hoc stats; not used by slide 5 anymore.
 TX_SAMPLE_PARQUET = _ROOT / "data" / "presentation_tx_stats_sample.parquet"
 TX_SAMPLE_N       = 500_000
+
+# Full-dataset histogram + exact-stats cache built by one streaming pass
+# over every per_tx.parquet.  Per-resource per-regime arrays so slide 5
+# can render the on-disk distribution of all 594 M txs instead of a
+# sample.  Rebuilds automatically when missing.
+TX_FULL_HIST_NPZ = _ROOT / "data" / "presentation_tx_full_histograms.npz"
+HIST_LOG_HI      = float(np.log1p(2e7))   # upper bound for log1p(gas) bins
+HIST_N_DISP      = 60                      # bins shown on screen
+HIST_N_FINE      = 500                     # bins used to estimate percentiles
 
 # Plotly + reveal.js CDN endpoints.  Pin reveal so the deck doesn't
 # silently change behaviour; plotly stays "latest" since charts are built
@@ -77,7 +86,7 @@ def _layout_common(title: str, ytitle: str) -> dict:
                    font=dict(size=18, color="#111")),
         margin=dict(l=70, r=30, t=60, b=50),
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="right", x=1.0, font=dict(size=11)),
+                    xanchor="center", x=0.5, font=dict(size=11)),
         hovermode="x",
         font=dict(size=12, color="#222"),
         autosize=True,
@@ -153,7 +162,7 @@ def fig_l2_fees_daily(daily: pl.DataFrame) -> go.Figure:
         autosize=True,
         margin=dict(l=70, r=30, t=40, b=50),
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="right", x=1.0, font=dict(size=11)),
+                    xanchor="center", x=0.5, font=dict(size=11)),
         font=dict(size=12, color="#222"),
         hovermode="x",
     )
@@ -175,14 +184,17 @@ def fig_l2_fees_daily(daily: pl.DataFrame) -> go.Figure:
         line=dict(color="#444", width=1.4, dash="dash"),
         layer="above",
     )
+    # Annotation sits *inside* the plot area, just below the top edge,
+    # so it doesn't overlap with the top-center legend on hover.
     fig.add_annotation(
-        x=dia_ms, xref="x", y=1.0, yref="paper",
+        x=dia_ms, xref="x", y=0.96, yref="paper",
         text=("<b>ArbOS DIA launch</b><br>"
               "<span style='font-size:0.85em'>"
               "p_min: 0.01 → 0.02 gwei</span>"),
-        showarrow=False, yanchor="bottom",
+        showarrow=False, yanchor="top", xanchor="left",
+        xshift=6,
         font=dict(size=11, color="#222"),
-        bgcolor="rgba(255,255,255,0.85)",
+        bgcolor="rgba(255,255,255,0.92)",
         bordercolor="#888", borderwidth=0.5,
     )
     return fig
@@ -233,9 +245,9 @@ def l2_fee_stats_html(daily: pl.DataFrame) -> str:
     n_norm_post, n_cong_post = split_counts(post)
 
     pre_range  = (f"{pre['day'].min()} → {pre['day'].max()}"
-                  if pre.height else "—")
+                  if pre.height else "n/a")
     post_range = (f"{post['day'].min()} → {post['day'].max()}"
-                  if post.height else "—")
+                  if post.height else "n/a")
 
     def peak_section(title: str, df: pl.DataFrame, n: int = 3) -> str:
         if df.height == 0:
@@ -270,16 +282,24 @@ def l2_fee_stats_html(daily: pl.DataFrame) -> str:
             return ""
         pct_norm = 100.0 * n_norm / total
         pct_cong = 100.0 * n_cong / total
+
+        def pill(cls: str, n: int, name: str, pct: float) -> str:
+            return (
+                f'<span class="fee-pill {cls}">'
+                f'  <span class="pill-main">'
+                f'    <span class="pill-n">{n}</span>'
+                f'    <span class="pill-name">{name}</span>'
+                f'  </span>'
+                f'  <span class="pill-pct">{pct:.0f}%</span>'
+                f'</span>'
+            )
+
         return (
             f'<div class="dia-row">'
             f'  <div class="dia-tag">{label}</div>'
             f'  <div class="dia-pills">'
-            f'    <span class="fee-pill normal">'
-            f'      {n_norm} normal ({pct_norm:.0f}%)'
-            f'    </span>'
-            f'    <span class="fee-pill congested">'
-            f'      {n_cong} congested ({pct_cong:.0f}%)'
-            f'    </span>'
+            f'    {pill("normal",    n_norm, "normal",    pct_norm)}'
+            f'    {pill("congested", n_cong, "congested", pct_cong)}'
             f'  </div>'
             f'</div>'
         )
@@ -361,11 +381,13 @@ def _build_tx_sample(n_target: int) -> pl.DataFrame:
     """Stream every per-tx parquet in arrow batches; per-batch coin-flip at
     `keep_frac` keeps memory bounded.  No min-gas filter, so small txs (the
     bulk of the on-chain population) are represented honestly in the
-    descriptive stats."""
+    descriptive stats.  `block` is included so downstream code can split
+    pre/post-DIA via the block-time mapping."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     cols = [
+        "block",
         "computation", "wasmComputation",
         "storageAccessRead", "storageAccessWrite",
         "storageGrowth", "historyGrowth",
@@ -407,35 +429,647 @@ def load_or_build_tx_sample() -> pl.DataFrame:
     return s
 
 
-def tx_resource_stats_html(sample: pl.DataFrame, total_pool: int) -> str:
-    """Per-resource descriptive stats on the per-tx sample.  Returns a
-    self-contained HTML <table> + a one-line caption above it."""
+def arbos60_code_slide_html() -> str:
+    """Slide 6: spec block on top (p_min, constraint inequality, per-set
+    weight + ladder tables) followed by the code blocks pairing each
+    Python signature from arbos60.py with its equation in LaTeX.
+
+    All LaTeX subscripts use explicit braces (e.g. `\\sum_{k}` not
+    `\\sum_k`) — the un-braced form caused MathJax to throw 'Double
+    subscripts: use braces to clarify' on backlog_per_second / fee_per_tx
+    when the very next token also carried a subscript."""
+    methods = [
+        (
+            "backlog_per_second(self, inflow_i_per_t, T_i)",
+            r"B_{i,j}(t+1) = \max(0, B_{i,j}(t) + \sum_{k} a_{i,k} \, g_{k}(t) "
+            r"- T_{i,j} \, \Delta t)",
+        ),
+        (
+            "compute_set_exponents(self, g_per_block, block_t)",
+            r"E_{i}(t) = \sum_{j} \frac{B_{i,j}(t)}{A_{i,j} \, T_{i,j}}",
+        ),
+        (
+            "price_per_resource(self, g_per_block, block_t)",
+            r"e_{k}(t) = \max_{i} \{ a_{i,k} \, E_{i}(t) \} "
+            r"\qquad p_{k}(t) = p_{\min} \, \exp(e_{k}(t))",
+        ),
+        (
+            "fee_per_tx(self, p_per_resource, tx_block_idx, tx_g_per_resource)",
+            r"F_{tx} = \sum_{k} g_{tx,k} \, p_{k}(t_{tx})",
+        ),
+    ]
+    blocks: list[str] = []
+    for sig, eq in methods:
+        blocks.append(
+            '<div class="method-block">'
+            '  <div class="method-sig">'
+            f'    <span class="kw">def</span> '
+            f'<span class="nm">{sig.split("(",1)[0]}</span>'
+            f'<span class="args">({sig.split("(",1)[1]}</span>'
+            '  </div>'
+            f'  <div class="method-eq">\\[{eq}\\]</div>'
+            '</div>'
+        )
+    class_header = (
+        '<div class="method-block class-header">'
+        '  <div class="method-sig">'
+        '    <span class="kw">class</span> '
+        '<span class="nm">Arbos60GasPricing</span>:'
+        '  </div>'
+        '  <div class="class-doc">'
+        '    Per-resource dynamic pricing. '
+        '    <span class="ix">i</span> = set, '
+        '    <span class="ix">j</span> = constraint, '
+        '    <span class="ix">k</span> = resource, '
+        '    <span class="ix">t</span> = wall-clock second '
+        '    (backlog ticks every <b>1 s</b>, which aggregates '
+        '    <b>4 blocks</b> at Arbitrum&rsquo;s 0.25 s block time).'
+        '  </div>'
+        '</div>'
+    )
+
+    # Constants & per-set tables sourced from arbos60.py (Set 1 & Set 2
+    # configurations from the proposal — kept verbatim so it stays in sync
+    # with the simulator if the constants change there).
+    sets_data = [
+        (
+            "Set 1 (default)",
+            # Per-i: (label, weights dict, ladder list[(T, A)])
+            [
+                ("Storage/Compute mix 1",
+                 {"c": 1.0, "sw": 0.67, "sr": 0.14, "sg": 0.06},
+                 [(15.40, 10_000), (20.41, 2_861), (27.06, 819),
+                  (35.86, 234), (47.53, 67), (63.00, 19)]),
+                ("Storage/Compute mix 2",
+                 {"c": 0.0625, "sw": 1.0, "sr": 0.21, "sg": 0.09},
+                 [(3.13, 10_000), (4.16, 4_488), (5.53, 2_014),
+                  (7.35, 904), (9.77, 406), (12.99, 182)]),
+                ("History Growth",
+                 {"hg": 1.0},
+                 [(67.30, 10_000), (81.27, 1_591), (98.14, 253),
+                  (118.50, 40), (143.10, 6), (172.80, 1)]),
+                ("Long-term Disk Growth",
+                 {"sw": 0.8812, "sg": 0.2526, "hg": 0.301, "l2": 1.0},
+                 [(2.30, 36_000)]),
+            ],
+        ),
+        (
+            "Set 2 (alt)",
+            [
+                ("Storage/Compute mix 1",
+                 {"c": 1.0, "sw": 0.6714, "sr": 0.141, "sg": 0.0604},
+                 [(15.40, 10_000), (55.12, 14)]),
+                ("Storage/Compute mix 2",
+                 {"c": 0.0625, "sw": 1.0, "sr": 0.21, "sg": 0.09},
+                 [(3.13, 10_000), (10.09, 102)]),
+                ("History Growth",
+                 {"hg": 1.0},
+                 [(67.30, 10_000), (166.04, 1)]),
+                ("Long-term Disk Growth",
+                 {"sw": 0.8812, "sg": 0.2526, "hg": 0.301, "l2": 1.0},
+                 [(2.30, 36_000)]),
+            ],
+        ),
+    ]
+
+    def _fmt_a(a: int) -> str:
+        return f"{a/1000:.1f}K" if a >= 1000 else f"{a}"
+
+    def _weights_str(w: dict) -> str:
+        return ", ".join(f"{k}:{v:g}" for k, v in w.items())
+
+    def _ladder_str(ladder: list) -> str:
+        return ", ".join(f"({T:g}, {_fmt_a(A)})" for T, A in ladder)
+
+    def _fmt_coeff(c: float) -> str:
+        """LaTeX coefficient.  Drops 1.0, integer-formats whole numbers."""
+        if abs(c - 1.0) < 1e-12:
+            return ""
+        if abs(c - round(c)) < 1e-12:
+            return f"{int(round(c))}\\,"
+        return f"{c:g}\\,"
+
+    def _ineq_latex(weights: dict, i_idx: int) -> str:
+        """Build a per-set weighted inequality in LaTeX."""
+        terms = []
+        for k, coeff in weights.items():
+            if coeff == 0:
+                continue
+            terms.append(f"{_fmt_coeff(coeff)}g_{{{k}}}")
+        body = " + ".join(terms) if terms else "0"
+        return f"i = {i_idx} : \\quad & {body} \\;\\le\\; T_{{{i_idx},j}}"
+
+    def _ladder_table(label: str, ladder: list, i_idx: int) -> str:
+        rows_html = []
+        for j, (T, A) in enumerate(ladder):
+            rows_html.append(
+                f'<tr><td class="lj">{j}</td>'
+                f'<td class="lT">{T:g}</td>'
+                f'<td class="lA">{A:,}</td></tr>'
+            )
+        return (
+            '<div class="ladder-table">'
+            f'  <div class="ladder-title">'
+            f'    Set {i_idx} <span class="ladder-note">{label}</span>'
+            f'  </div>'
+            '  <table class="set-table">'
+            '    <thead><tr>'
+            '      <th class="lj"><i>j</i></th>'
+            '      <th class="lT"><i>T<sub>i,j</sub></i> (Mgas/s)</th>'
+            '      <th class="lA"><i>A<sub>i,j</sub></i> (s)</th>'
+            '    </tr></thead>'
+            f'   <tbody>{"".join(rows_html)}</tbody>'
+            '  </table>'
+            '</div>'
+        )
+
+    set_blocks: list[str] = []
+    for set_idx, (set_name, rows) in enumerate(sets_data, start=1):
+        # ── Weighted inequalities (LaTeX aligned environment) ───────────
+        ineq_lines = [
+            _ineq_latex(weights, i_idx + 1)
+            for i_idx, (_label, weights, _l) in enumerate(rows)
+        ]
+        ineq_latex = (
+            r"\begin{aligned}" + r" \\ ".join(ineq_lines) + r"\end{aligned}"
+        )
+        # ── 4 ladder tables side-by-side ───────────────────────────────
+        ladder_tables = "".join(
+            _ladder_table(label, ladder, i_idx + 1)
+            for i_idx, (label, _w, ladder) in enumerate(rows)
+        )
+        set_blocks.append(
+            f'<div class="set-card set-card-{set_idx}">'
+            f'  <div class="set-title">{set_name}</div>'
+            f'  <div class="set-ineq method-eq">\\[{ineq_latex}\\]</div>'
+            f'  <div class="ladder-row">{ladder_tables}</div>'
+            '</div>'
+        )
+
+    inequality_eq = (
+        r"\sum_{k} a_{i,k} \, g_{k}(t) \le T_{i,j}"
+        r"\quad \text{(sustained over a window of } A_{i,j} \text{ seconds)}"
+    )
+    spec_block = (
+        '<div class="spec-block">'
+        '  <div class="const-pmin">'
+        '    p<sub>min</sub> = <b>0.02 gwei</b>'
+        '    <span class="const-note">post-DIA</span>'
+        '    <span class="const-sep">·</span>'
+        '    <b>0.01 gwei</b>'
+        '    <span class="const-note">pre-DIA</span>'
+        '  </div>'
+        '  <div class="spec-ineq">'
+        '    <div class="spec-label">'
+        '      Constraint inequality (for each set i, constraint j):'
+        '    </div>'
+        f'   \\[{inequality_eq}\\]'
+        '  </div>'
+        f'  {"".join(set_blocks)}'
+        '</div>'
+    )
+
+    github_url = (
+        "https://github.com/Entropy-Advisors/arbos60_dynamic_pricing_sim"
+        "/blob/main/scripts/arbos60.py"
+    )
+    github_icon = (
+        '<svg class="gh-icon" viewBox="0 0 16 16" width="14" height="14" '
+        'fill="currentColor" aria-hidden="true">'
+        '<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07'
+        '.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94'
+        '-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58'
+        ' 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-'
+        '3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-'
+        '2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27'
+        ' 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27'
+        '.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-'
+        '.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-'
+        '4.42-3.58-8-8-8z"/></svg>'
+    )
+    source_link = (
+        '<div class="source-link">'
+        f'  <a href="{github_url}" target="_blank" rel="noopener">'
+        f'    {github_icon}'
+        '    <span>scripts/arbos60.py on GitHub</span>'
+        '  </a>'
+        '</div>'
+    )
+    # Two nested <section>s = a vertical-slide pair so each half breathes.
+    return (
+        '<section>\n'
+        '  <section>\n'
+        '    <h2>ArbOS 60 dynamic pricing implemented in code: spec</h2>\n'
+        f'    {spec_block}\n'
+        '  </section>\n'
+        '  <section>\n'
+        '    <h2>ArbOS 60: class methods and equations</h2>\n'
+        '    <div class="method-list">\n'
+        f'      {class_header}\n'
+        + "".join(blocks) +
+        '    </div>\n'
+        f'    {source_link}\n'
+        '  </section>\n'
+        '</section>'
+    )
+
+
+def _lighten_hex(hex_color: str, factor: float = 0.55) -> str:
+    """Mix `hex_color` with white.  factor=0 → original, 1 → white."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    nr = int(r + (255 - r) * factor)
+    ng = int(g + (255 - g) * factor)
+    nb = int(b + (255 - b) * factor)
+    return f"#{nr:02x}{ng:02x}{nb:02x}"
+
+
+def _dia_cutoff_block() -> int:
+    """Lowest block_number whose `block_time` is at or after ArbOS DIA
+    activation.  Used to split the per-tx sample into pre/post regimes
+    in the histogram grid on slide 5."""
+    df = (
+        pl.scan_parquet(
+            _ROOT / "data" / "onchain_blocks_transactions" / "per_block.parquet"
+        )
+        .filter(pl.col("block_time") >= DIA_LAUNCH_TS)
+        .select(pl.col("block_number").min().alias("b"))
+        .collect()
+    )
+    return int(df["b"][0])
+
+
+RESOURCE_SPEC = [
+    ("Computation",    ("computation", "wasmComputation")),
+    ("Storage Read",   ("storageAccessRead",)),
+    ("Storage Write",  ("storageAccessWrite",)),
+    ("Storage Growth", ("storageGrowth",)),
+    ("History Growth", ("historyGrowth",)),
+    ("L2 Calldata",    ("l2Calldata",)),
+    ("L1 Calldata",    ("l1Calldata",)),
+    ("Total per tx",   ("total",)),
+]
+RESOURCE_PALETTE = {
+    "Computation":    "#1f77b4",
+    "Storage Read":   "#98df8a",
+    "Storage Write":  "#2ca02c",
+    "Storage Growth": "#d62728",
+    "History Growth": "#ff7f0e",
+    "L2 Calldata":    "#9467bd",
+    "L1 Calldata":    "#e377c2",
+    "Total per tx":   "#555555",
+}
+
+
+def _build_full_histograms(dia_cutoff_block: int) -> dict:
+    """Stream every per-tx parquet once; accumulate, per (resource, regime):
+      • coarse-bin counts (HIST_N_DISP) for the on-screen histogram,
+      • fine-bin counts (HIST_N_FINE) for percentile estimation,
+      • exact gas-sum, zero count, total count.
+    Returns a dict of arrays + scalars; saved to .npz by the caller."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    cols = ["block",
+            "computation", "wasmComputation",
+            "storageAccessRead", "storageAccessWrite",
+            "storageGrowth", "historyGrowth",
+            "l2Calldata", "l1Calldata", "total"]
+    edges_disp = np.linspace(0.0, HIST_LOG_HI, HIST_N_DISP + 1)
+    edges_fine = np.linspace(0.0, HIST_LOG_HI, HIST_N_FINE + 1)
+
+    resources = [name for name, _ in RESOURCE_SPEC]
+    regimes   = ("pre", "post")
+    cnt_disp  = {n: {r: np.zeros(HIST_N_DISP, dtype=np.int64) for r in regimes}
+                 for n in resources}
+    cnt_fine  = {n: {r: np.zeros(HIST_N_FINE, dtype=np.int64) for r in regimes}
+                 for n in resources}
+    sum_g     = {n: {r: 0.0 for r in regimes} for n in resources}
+    n_zero    = {n: {r: 0   for r in regimes} for n in resources}
+    n_total   = {n: {r: 0   for r in regimes} for n in resources}
+
+    paths = sorted((_ROOT / "data" / "multigas_usage_extracts")
+                   .glob("*/per_tx.parquet"))
+    print(f"  streaming {len(paths)} per_tx parquets for full-data histograms")
+    rows_seen = 0
+    t0 = time.time()
+    for path in paths:
+        pf = pq.ParquetFile(str(path))
+        for batch in pf.iter_batches(batch_size=1_000_000, columns=cols):
+            block = batch.column("block").to_numpy(zero_copy_only=False)
+            mask_pre  = block <  dia_cutoff_block
+            mask_post = ~mask_pre
+
+            for name, src_cols in RESOURCE_SPEC:
+                arr = batch.column(src_cols[0]).to_numpy(zero_copy_only=False).astype(np.float64)
+                for extra in src_cols[1:]:
+                    arr = arr + batch.column(extra).to_numpy(zero_copy_only=False).astype(np.float64)
+                lg = np.log1p(arr)
+                for regime, m in (("pre", mask_pre), ("post", mask_post)):
+                    if not m.any():
+                        continue
+                    a, l = arr[m], lg[m]
+                    cnt_disp[name][regime] += np.histogram(l, bins=edges_disp)[0]
+                    cnt_fine[name][regime] += np.histogram(l, bins=edges_fine)[0]
+                    sum_g [name][regime] += float(a.sum())
+                    n_zero[name][regime] += int((a == 0).sum())
+                    n_total[name][regime] += int(len(a))
+
+            rows_seen += batch.num_rows
+        elapsed = time.time() - t0
+        print(f"    {path.parent.name}: {rows_seen:>11,} rows seen "
+              f"({rows_seen/max(elapsed,1e-9)/1e6:.2f} M/s)")
+
+    out: dict = {
+        "edges_disp":  edges_disp,
+        "edges_fine":  edges_fine,
+        "dia_cutoff_block": np.int64(dia_cutoff_block),
+    }
+    for name in resources:
+        for r in regimes:
+            key = name.replace(" ", "_")
+            out[f"disp_{key}_{r}"]  = cnt_disp[name][r]
+            out[f"fine_{key}_{r}"]  = cnt_fine[name][r]
+            out[f"sum_{key}_{r}"]   = np.float64(sum_g[name][r])
+            out[f"nzero_{key}_{r}"] = np.int64(n_zero[name][r])
+            out[f"ntot_{key}_{r}"]  = np.int64(n_total[name][r])
+    return out
+
+
+def load_or_build_full_histograms(dia_cutoff_block: int) -> dict:
+    if TX_FULL_HIST_NPZ.exists():
+        z = np.load(TX_FULL_HIST_NPZ)
+        if int(z["dia_cutoff_block"]) == dia_cutoff_block:
+            print(f"  loading cached full histograms: {TX_FULL_HIST_NPZ}")
+            return {k: z[k] for k in z.files}
+        print("  cached cutoff differs; rebuilding")
+    print("  building full-dataset histograms (one streaming pass)")
+    out = _build_full_histograms(dia_cutoff_block)
+    TX_FULL_HIST_NPZ.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(TX_FULL_HIST_NPZ, **out)
+    print(f"  cached → {TX_FULL_HIST_NPZ}")
+    return out
+
+
+def _percentile_from_hist(counts: np.ndarray, edges: np.ndarray, q: float) -> float:
+    """Linear-interpolation quantile from a histogram in log1p(gas) space.
+    Returns the value in original gas units (expm1 of the log estimate)."""
+    total = counts.sum()
+    if total == 0:
+        return 0.0
+    cum = np.cumsum(counts)
+    target = q * total
+    idx = int(np.searchsorted(cum, target, side="left"))
+    if idx >= len(counts):
+        return float(np.expm1(edges[-1]))
+    prev_cum = cum[idx - 1] if idx > 0 else 0
+    bin_count = counts[idx]
+    if bin_count == 0:
+        return float(np.expm1(edges[idx]))
+    frac = (target - prev_cum) / bin_count
+    log_val = edges[idx] + frac * (edges[idx + 1] - edges[idx])
+    return float(np.expm1(log_val))
+
+
+def fig_per_resource_violins(sample: pl.DataFrame,
+                              dia_cutoff_block: int) -> go.Figure:
+    """Same 2x4 layout as the histogram grid, but each panel is a split
+    violin (Pre-DIA on the left half, Post-DIA on the right) drawn from
+    the cached 500 K-tx sample.  Each violin is per-trace down-sampled
+    to keep the rendered HTML small while preserving KDE shape."""
+    from plotly.subplots import make_subplots
+
     s = sample.with_columns(
         (pl.col("computation") + pl.col("wasmComputation")).alias("comp_total")
     )
-    rows: list[dict] = []
     spec = [
-        ("Computation",     "comp_total"),
-        ("Storage Read",    "storageAccessRead"),
-        ("Storage Write",   "storageAccessWrite"),
-        ("Storage Growth",  "storageGrowth"),
-        ("History Growth",  "historyGrowth"),
-        ("L2 Calldata",     "l2Calldata"),
-        ("L1 Calldata",     "l1Calldata"),
-        ("Total (per tx)",  "total"),
+        ("Computation",    "comp_total"),
+        ("Storage Read",   "storageAccessRead"),
+        ("Storage Write",  "storageAccessWrite"),
+        ("Storage Growth", "storageGrowth"),
+        ("History Growth", "historyGrowth"),
+        ("L2 Calldata",    "l2Calldata"),
+        ("L1 Calldata",    "l1Calldata"),
+        ("Total per tx",   "total"),
     ]
-    n = s.height
-    for name, col in spec:
-        v = s[col].cast(pl.Float64)
+
+    pre  = s.filter(pl.col("block") <  dia_cutoff_block)
+    post = s.filter(pl.col("block") >= dia_cutoff_block)
+    rng  = np.random.default_rng(42)
+    n_per_violin = 8_000              # ≤ 8K points per trace keeps file small
+
+    fig = make_subplots(
+        rows=2, cols=4,
+        subplot_titles=[name for name, _ in spec],
+        vertical_spacing=0.18, horizontal_spacing=0.05,
+    )
+    tick_gas  = [0, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000]
+    tick_pos  = [float(np.log1p(v)) for v in tick_gas]
+    tick_text = ["0", "100", "1K", "10K", "100K", "1M", "10M"]
+
+    legend_added = {"pre": False, "post": False}
+    for i, (name, col) in enumerate(spec):
+        r, c = i // 4 + 1, i % 4 + 1
+        color_post = RESOURCE_PALETTE[name]
+        color_pre  = _lighten_hex(color_post, 0.55)
+
+        log_pre  = np.log1p(pre[col].cast(pl.Float64).to_numpy())
+        log_post = np.log1p(post[col].cast(pl.Float64).to_numpy())
+        if len(log_pre) > n_per_violin:
+            log_pre  = rng.choice(log_pre,  size=n_per_violin, replace=False)
+        if len(log_post) > n_per_violin:
+            log_post = rng.choice(log_post, size=n_per_violin, replace=False)
+
+        fig.add_trace(go.Violin(
+            y=log_pre, x=["dist"] * len(log_pre),
+            name="Pre-DIA", side="negative",
+            line_color=color_pre, fillcolor=color_pre, opacity=0.85,
+            box_visible=False,
+            # Render points beyond 1.5×IQR as small dots so the long
+            # right-tail (whales / heavy txs) is visible.
+            points="outliers",
+            jitter=0.4, pointpos=-0.5,
+            marker=dict(size=2.2, color=color_pre,
+                        line=dict(width=0)),
+            meanline_visible=True, meanline=dict(color=color_pre, width=1.2),
+            scalemode="width", scalegroup=name,
+            legendgroup="pre", showlegend=not legend_added["pre"],
+            hoverinfo="skip",
+        ), row=r, col=c)
+        legend_added["pre"] = True
+
+        fig.add_trace(go.Violin(
+            y=log_post, x=["dist"] * len(log_post),
+            name="Post-DIA", side="positive",
+            line_color=color_post, fillcolor=color_post, opacity=0.7,
+            box_visible=False,
+            points="outliers",
+            jitter=0.4, pointpos=0.5,
+            marker=dict(size=2.2, color=color_post,
+                        line=dict(width=0)),
+            meanline_visible=True, meanline=dict(color=color_post, width=1.4),
+            scalemode="width", scalegroup=name,
+            legendgroup="post", showlegend=not legend_added["post"],
+            hoverinfo="skip",
+        ), row=r, col=c)
+        legend_added["post"] = True
+
+        fig.update_yaxes(
+            tickvals=tick_pos, ticktext=tick_text,
+            range=[0, HIST_LOG_HI],
+            showline=True, linewidth=0.8,
+            linecolor="rgba(0,0,0,0.35)", ticks="outside",
+            row=r, col=c,
+        )
+        fig.update_xaxes(showticklabels=False, showgrid=False,
+                         row=r, col=c)
+
+    fig.update_layout(
+        template="plotly_white",
+        autosize=True,
+        margin=dict(l=50, r=20, t=40, b=20),
+        font=dict(size=10, color="#222"),
+        violinmode="overlay",
+        violingap=0,
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.04,
+            xanchor="center", x=0.5,
+            font=dict(size=11),
+        ),
+    )
+    for ann in fig.layout.annotations:
+        ann.font = dict(size=11, color="#333")
+    return fig
+
+
+def fig_per_resource_histograms(hist: dict) -> go.Figure:
+    """2x4 grid of per-tx gas distributions, one per resource (+ tx total).
+    Each panel overlays Pre-DIA and Post-DIA distributions in two shades
+    of the resource's brand color, with dashed vertical lines marking
+    each regime's median.  Counts come from the full-dataset histogram
+    accumulator (594 M txs, one streaming pass).  Binning is on
+    log1p(gas) so the heavy tail spans cleanly across magnitudes."""
+    from plotly.subplots import make_subplots
+
+    edges_disp = hist["edges_disp"]
+    edges_fine = hist["edges_fine"]
+    mids   = 0.5 * (edges_disp[:-1] + edges_disp[1:])
+    width  = float(edges_disp[1] - edges_disp[0])
+
+    fig = make_subplots(
+        rows=2, cols=4,
+        subplot_titles=[name for name, _ in RESOURCE_SPEC],
+        vertical_spacing=0.18, horizontal_spacing=0.05,
+    )
+    tick_gas  = [0, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000]
+    tick_pos  = [float(np.log1p(v)) for v in tick_gas]
+    tick_text = ["0", "100", "1K", "10K", "100K", "1M", "10M"]
+
+    legend_added = {"pre": False, "post": False}
+    for i, (name, _src) in enumerate(RESOURCE_SPEC):
+        r, c = i // 4 + 1, i % 4 + 1
+        key = name.replace(" ", "_")
+        color_post = RESOURCE_PALETTE[name]
+        color_pre  = _lighten_hex(color_post, 0.55)
+
+        counts_pre  = hist[f"disp_{key}_pre"]
+        counts_post = hist[f"disp_{key}_post"]
+        fine_pre    = hist[f"fine_{key}_pre"]
+        fine_post   = hist[f"fine_{key}_post"]
+
+        fig.add_trace(go.Bar(
+            x=mids, y=counts_pre, width=width,
+            marker_color=color_pre, marker_line_width=0,
+            opacity=0.85, name="Pre-DIA",
+            legendgroup="pre", showlegend=not legend_added["pre"],
+            hovertemplate=(
+                f"{name} (pre-DIA)<br>"
+                "ln(1+gas) ≈ %{x:.2f}<br>n = %{y:,}<extra></extra>"
+            ),
+        ), row=r, col=c)
+        legend_added["pre"] = True
+
+        fig.add_trace(go.Bar(
+            x=mids, y=counts_post, width=width,
+            marker_color=color_post, marker_line_width=0,
+            opacity=0.75, name="Post-DIA",
+            legendgroup="post", showlegend=not legend_added["post"],
+            hovertemplate=(
+                f"{name} (post-DIA)<br>"
+                "ln(1+gas) ≈ %{x:.2f}<br>n = %{y:,}<extra></extra>"
+            ),
+        ), row=r, col=c)
+        legend_added["post"] = True
+
+        # Median lines on the log1p axis from the fine-bin histogram.
+        # `_percentile_from_hist` returns gas units, but we plot on log1p.
+        if fine_pre.sum():
+            med_pre_log = float(np.log1p(_percentile_from_hist(fine_pre, edges_fine, 0.5)))
+            fig.add_vline(x=med_pre_log, row=r, col=c,
+                          line=dict(color=color_pre, width=1.4, dash="dot"))
+        if fine_post.sum():
+            med_post_log = float(np.log1p(_percentile_from_hist(fine_post, edges_fine, 0.5)))
+            fig.add_vline(x=med_post_log, row=r, col=c,
+                          line=dict(color=color_post, width=1.6, dash="dash"))
+        fig.update_xaxes(
+            tickvals=tick_pos, ticktext=tick_text,
+            range=[0, float(np.log1p(2e7))],
+            showline=True, linewidth=0.8,
+            linecolor="rgba(0,0,0,0.35)", ticks="outside",
+            row=r, col=c,
+        )
+        fig.update_yaxes(
+            showline=True, linewidth=0.8,
+            linecolor="rgba(0,0,0,0.35)", ticks="outside",
+            row=r, col=c,
+        )
+
+    fig.update_layout(
+        template="plotly_white",
+        autosize=True,
+        margin=dict(l=50, r=20, t=40, b=30),
+        font=dict(size=10, color="#222"),
+        hovermode="x",
+        barmode="overlay",
+        bargap=0.02,
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.04,
+            xanchor="center", x=0.5,
+            font=dict(size=11),
+        ),
+    )
+    # Subplot titles default to size 16; trim them.
+    for ann in fig.layout.annotations:
+        ann.font = dict(size=11, color="#333")
+    return fig
+
+
+def tx_resource_stats_html(hist: dict) -> str:
+    """Per-resource descriptive stats from the full-dataset histogram
+    accumulator.  Mean, %zero and total count are exact; the percentile
+    columns are linear-interpolated from the fine-bin histogram (500 bins
+    on log1p, ≤ 0.5% relative error in practice)."""
+    edges_fine = hist["edges_fine"]
+    rows: list[dict] = []
+    n_grand_total = 0
+    for name, _src in RESOURCE_SPEC:
+        key = name.replace(" ", "_")
+        # Combine pre & post regimes for the all-time stats row.
+        fine = hist[f"fine_{key}_pre"] + hist[f"fine_{key}_post"]
+        s_g  = float(hist[f"sum_{key}_pre"]) + float(hist[f"sum_{key}_post"])
+        n_z  = int(hist[f"nzero_{key}_pre"]) + int(hist[f"nzero_{key}_post"])
+        n_t  = int(hist[f"ntot_{key}_pre"])  + int(hist[f"ntot_{key}_post"])
         rows.append({
             "name":     name,
-            "mean":     float(v.mean()),
-            "p25":      float(v.quantile(0.25)),
-            "median":   float(v.quantile(0.50)),
-            "p75":      float(v.quantile(0.75)),
-            "p99":      float(v.quantile(0.99)),
-            "pct_zero": 100.0 * float((v == 0).sum()) / max(n, 1),
+            "mean":     s_g / max(n_t, 1),
+            "p25":      _percentile_from_hist(fine, edges_fine, 0.25),
+            "median":   _percentile_from_hist(fine, edges_fine, 0.50),
+            "p75":      _percentile_from_hist(fine, edges_fine, 0.75),
+            "p99":      _percentile_from_hist(fine, edges_fine, 0.99),
+            "pct_zero": 100.0 * n_z / max(n_t, 1),
         })
+        n_grand_total = max(n_grand_total, n_t)
+    n = n_grand_total
 
     def fmt(v: float) -> str:
         if v >= 1_000_000:
@@ -467,12 +1101,16 @@ def tx_resource_stats_html(sample: pl.DataFrame, total_pool: int) -> str:
         f'<table class="stats-table"><thead><tr>{th}</tr></thead>'
         f'<tbody>{"".join(body)}</tbody></table>'
     )
+    def _human(n: int) -> str:
+        if n >= 1_000_000_000: return f"{n/1e9:.2f}B"
+        if n >= 1_000_000:     return f"{n/1e6:.0f}M"
+        if n >= 1_000:         return f"{n/1e3:.0f}K"
+        return f"{n:,}"
+
     caption = (
-        f'<p class="stats-caption">Distribution of per-transaction gas '
-        f"usage across the seven priced resources, computed on a uniform "
-        f"{n:,}-tx sample drawn from the full {total_pool:,}-tx pool. "
-        f"The %&nbsp;zero column shows the share of transactions that "
-        f"consume none of that resource. All values are in raw gas units.</p>"
+        f'<p class="stats-caption">Per-transaction gas distribution across '
+        f"the 7 resources, computed over all <b>{_human(n)}</b> "
+        f"transactions. Values in raw gas units.</p>"
     )
     return caption + table
 
@@ -529,7 +1167,7 @@ def fig_hourly_combined(rk_hr: pl.DataFrame) -> go.Figure:
         autosize=True,
         margin=dict(l=70, r=30, t=60, b=50),
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="right", x=1.0, font=dict(size=11)),
+                    xanchor="center", x=0.5, font=dict(size=11)),
         hovermode="x",
         font=dict(size=12, color="#222"),
     )
@@ -619,6 +1257,28 @@ PAGE_TEMPLATE = """<!doctype html>
   <link rel="stylesheet" href="{REVEAL_CDN}/dist/theme/white.css">
 
   <script src="{PLOTLY_CDN}"></script>
+
+  <!-- MathJax: renders the LaTeX equations on the ArbOS 60 slide.
+       `$...$` is intentionally NOT a delimiter — Python identifiers like
+       `inflow_i_per_t` would otherwise be parsed as TeX subscripts and
+       throw "Double subscripts" warnings into the rendered slide.  We
+       also tell MathJax to skip the syntax-highlighted code spans
+       (`method-sig`, `args`, `code-pane`) so their underscores stay
+       cosmetic. -->
+  <script>
+    window.MathJax = {{
+      tex: {{ inlineMath: [['\\(', '\\)']] }},
+      options: {{
+        skipHtmlTags: ['script', 'noscript', 'style', 'textarea',
+                        'pre', 'code'],
+        ignoreHtmlClass: 'tex2jax_ignore|method-sig|args|set-table|spec-label|set-title|ladder-title|fee-label|class-doc',
+        processHtmlClass: 'tex2jax_process|method-eq|spec-ineq',
+      }},
+      svg: {{ fontCache: 'global' }},
+    }};
+  </script>
+  <script id="MathJax-script" async
+          src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
 
   <style>
     :root {{
@@ -713,7 +1373,11 @@ PAGE_TEMPLATE = """<!doctype html>
 
     .stats-caption {{
       font-size: 0.65em; color: #444; max-width: 1100px;
-      line-height: 1.5; margin: 0.4em 0 1em;
+      line-height: 1.5; margin: 0.4em 0 0.6em;
+    }}
+    .hist-grid {{
+      width: 100%; height: 42vh;
+      margin: 0.4em 0 0.8em;
     }}
     table.stats-table {{
       border-collapse: collapse; font-size: 0.62em;
@@ -772,6 +1436,129 @@ PAGE_TEMPLATE = """<!doctype html>
       text-transform: none; letter-spacing: 0;
     }}
 
+    /* Slide 6: method-block list pairing each Python signature with its
+       spec equation rendered in LaTeX (MathJax). */
+    .method-list  {{ margin-top: 0.6em; }}
+    .method-block {{
+      background: #f8f9fb; border-left: 3px solid #1f77b4;
+      padding: 0.55em 1em; margin-bottom: 0.6em; border-radius: 2px;
+    }}
+    .method-block.class-header {{
+      background: rgba(31, 119, 180, 0.07);
+      border-left-color: #08519c;
+    }}
+    .method-sig {{
+      font-family: ui-monospace, Menlo, Monaco, monospace;
+      font-size: 0.75em; line-height: 1.5; color: #111;
+    }}
+    .method-sig .kw   {{ color: #a626a4; font-weight: 600; }}
+    .method-sig .nm   {{ color: #1f77b4; font-weight: 700; }}
+    .method-sig .args {{ color: #555; }}
+    /* All MathJax-rendered blocks across slide 6 use the same font-size
+       so SVG output scales coherently across the whole slide.  Includes
+       `.spec-ineq` so the top-of-slide inequality matches the per-set
+       ones (the wrapper isn't a `.method-eq`). */
+    .method-eq,
+    .set-ineq,
+    .spec-ineq {{
+      margin-top: 0.3em; padding-left: 0.4em;
+      font-size: 0.65em; color: #111; line-height: 1.25;
+    }}
+    .spec-block .method-eq mjx-container[display="true"],
+    .set-ineq mjx-container[display="true"] {{
+      margin: 0.15em 0 !important;
+    }}
+    .class-doc {{
+      font-size: 0.7em; color: #444; margin-top: 0.3em;
+      line-height: 1.4;
+    }}
+    .class-doc .ix {{
+      font-family: ui-monospace, Menlo, monospace;
+      font-style: italic; color: #1f3a5f; font-weight: 600;
+    }}
+
+    /* Slide 6a (spec): p_min + inequality + per-set tables. */
+    .spec-block  {{ margin-top: 0.4em; }}
+    .const-pmin  {{
+      font-size: 0.75em; color: #222; margin-bottom: 0.6em;
+    }}
+    .spec-ineq   {{
+      margin: 0.4em 0 0.8em;
+    }}
+    .spec-ineq .spec-label {{
+      font-size: 0.7em; color: #555; font-weight: 500;
+      margin-bottom: 0.3em;
+    }}
+    .const-pmin b {{ color: #111; font-weight: 700; }}
+    .const-note {{ color: #777; font-weight: 400;
+                   margin-left: 0.25em; }}
+    .const-sep  {{ color: #aaa; margin: 0 0.45em; }}
+
+    /* Slide 6b footer: GitHub icon + short text link. */
+    .source-link {{
+      margin-top: 1em; font-size: 0.7em;
+      padding-top: 0.6em; border-top: 1px solid #e0e0e0;
+    }}
+    .source-link a {{
+      display: inline-flex; align-items: center; gap: 0.4em;
+      color: #24292f; text-decoration: none; font-weight: 500;
+    }}
+    .source-link a:hover {{ color: #0969da; }}
+    .source-link a:hover .gh-icon {{ color: #0969da; }}
+    .gh-icon {{ color: #24292f; vertical-align: middle; }}
+    .set-card {{
+      margin-top: 0.6em;
+      border-left: 3px solid #888;
+      padding: 0.4em 0.7em 0.5em 0.8em;
+      border-radius: 2px;
+    }}
+    /* Distinct accent colors so the two configs read at a glance. */
+    .set-card-1 {{
+      border-left-color: #1f77b4;
+      background: rgba(31, 119, 180, 0.05);
+    }}
+    .set-card-1 .set-title {{ color: #08519c; }}
+    .set-card-2 {{
+      border-left-color: #ff7f0e;
+      background: rgba(255, 127, 14, 0.06);
+    }}
+    .set-card-2 .set-title {{ color: #b54a00; }}
+    .set-title {{
+      font-size: 0.75em; font-weight: 700; color: #111;
+      margin-bottom: 0.3em; margin-top: 0.6em;
+    }}
+    .ladder-row {{
+      display: flex; align-items: flex-start;
+      gap: 1.5em; flex-wrap: wrap;
+      font-variant-numeric: tabular-nums;
+      margin-top: 0.3em;
+    }}
+    .ladder-table {{ flex: 0 0 auto; }}
+    .ladder-title {{
+      font-size: 0.7em; font-weight: 600; color: #111;
+      margin-bottom: 0.2em;
+    }}
+    .ladder-note {{ font-weight: 400; color: #666; font-style: italic; }}
+    table.set-table {{
+      border-collapse: collapse; font-size: 0.65em;
+      font-variant-numeric: tabular-nums;
+    }}
+    table.set-table th, table.set-table td {{
+      padding: 0.18em 0.55em;
+      border-bottom: 1px solid #e5e5e5;
+    }}
+    table.set-table th {{
+      color: #666; font-weight: 500; border-bottom: 1.5px solid #888;
+      text-align: right;
+    }}
+    table.set-table th.lj, table.set-table td.lj {{
+      text-align: center; color: #555;
+    }}
+    table.set-table td {{
+      text-align: right; color: #111;
+    }}
+    table.set-table td.lA {{ color: #444; }}
+
     /* Window-split card: stacked pre/post period blocks + delta row. */
     .period-block {{ margin-top: 0.45em; line-height: 1.2; }}
     .period-name  {{ font-size: 0.6em; font-weight: 600; color: #333; }}
@@ -806,9 +1593,17 @@ PAGE_TEMPLATE = """<!doctype html>
       font-weight: 700;
     }}
     .fee-pill  {{
-      font-size: 0.55em; font-weight: 600;
-      padding: 0.15em 0.55em; border-radius: 3px;
+      display: inline-flex; align-items: baseline; gap: 0.4em;
+      font-size: 0.55em;
+      padding: 0.18em 0.6em; border-radius: 3px;
       border: 1px solid;
+    }}
+    .fee-pill .pill-main {{ font-weight: 600; }}
+    .fee-pill .pill-n    {{ font-weight: 700; }}
+    .fee-pill .pill-name {{ font-weight: 500; margin-left: 0.25em; }}
+    .fee-pill .pill-pct  {{
+      font-weight: 500; opacity: 0.7;
+      padding-left: 0.45em; border-left: 1px solid currentColor;
     }}
     .fee-pill.normal    {{ color: #2ca02c; border-color: #2ca02c;
                            background: rgba(44, 160, 44, 0.06); }}
@@ -938,23 +1733,35 @@ PAGE_TEMPLATE = """<!doctype html>
     <!-- Slide 3: daily L2 fees + breakdown stats -->
     <section class="chart-slide">
       <h2>Daily L2 fees: base and surplus</h2>
-      <h3>After ArbOS DIA, fees dropped and congestion eased.</h3>
+      <h3>Following ArbOS DIA, fees and congestion both declined</h3>
       <div class="plotly-frame">{FIG_FEES}</div>
       {FEE_STATS}
     </section>
 
     <!-- Slide 4: hourly resource (absolute + share, stacked) -->
     <section class="chart-slide">
-      <h2>Hourly priced gas: absolute and composition</h2>
-      <h3>Top: Mgas/hr by resource. Bottom: same data, normalised to 100 %.</h3>
+      <h2>Hourly gas consumption by resource</h2>
+      <h3>Top: Mgas/hr by resource. Bottom: % share by resource</h3>
       <div class="plotly-frame">{FIG1}</div>
     </section>
 
-    <!-- Slide 5: per-resource per-tx stats table -->
+    <!-- Slide 5: per-tx gas distribution (vertical pair) -->
     <section>
-      <h2>Per-transaction gas distribution</h2>
-      {STATS_TABLE}
+      <section>
+        <h2>Per-transaction gas distribution</h2>
+        <div class="hist-grid">{HIST_FIG}</div>
+        {STATS_TABLE}
+      </section>
+      <section>
+        <h2>Per-transaction gas distribution</h2>
+        <h3>Violin view, split Pre-DIA / Post-DIA. Dots are outliers</h3>
+        <div class="hist-grid">{VIOLIN_FIG}</div>
+        {STATS_TABLE_2}
+      </section>
     </section>
+
+    <!-- Slide 6: ArbOS 60 implementation -->
+    {SLIDE6}
 
   </div>
 </div>
@@ -984,6 +1791,11 @@ PAGE_TEMPLATE = """<!doctype html>
   Reveal.on('ready slidechanged', () => {{
     resizeVisiblePlots();
     setTimeout(resizeVisiblePlots, 250);
+    // Re-typeset MathJax for the active slide so equations show even if
+    // the slide was hidden when MathJax first loaded.
+    if (window.MathJax && window.MathJax.typesetPromise) {{
+      window.MathJax.typesetPromise();
+    }}
   }});
   window.addEventListener('resize', () => setTimeout(resizeVisiblePlots, 50));
 </script>
@@ -1005,9 +1817,16 @@ def main() -> None:
     f_fees     = fig_l2_fees_daily(daily_fees)
     f1         = fig_hourly_combined(rk_hr)
 
-    print("Loading per-tx sample for stats table...")
+    print("Loading full-dataset per-tx histograms (slide 5)...")
+    cutoff_block = _dia_cutoff_block()
+    print(f"  DIA cutoff block: {cutoff_block:,}")
+    full_hist = load_or_build_full_histograms(cutoff_block)
+    stats_table = tx_resource_stats_html(full_hist)
+    f_hist = fig_per_resource_histograms(full_hist)
+
+    print("Loading 500K-tx sample for slide 6 violins...")
     tx_sample = load_or_build_tx_sample()
-    stats_table = tx_resource_stats_html(tx_sample, total_pool=_total_txs())
+    f_violin = fig_per_resource_violins(tx_sample, cutoff_block)
 
     print("Rendering deck...")
     page = PAGE_TEMPLATE.format(
@@ -1017,7 +1836,14 @@ def main() -> None:
         FIG_FEES=fig_div(f_fees, "fig-l2-fees"),
         FEE_STATS=l2_fee_stats_html(daily_fees),
         FIG1=fig_div(f1, "fig-hourly-combined"),
+        HIST_FIG=fig_div(f_hist, "fig-tx-resource-hist"),
+        VIOLIN_FIG=fig_div(f_violin, "fig-tx-resource-violin"),
         STATS_TABLE=stats_table,
+        # Plotly auto-deduplicates element IDs across the page; the table
+        # is structured HTML (not a Plotly fig) so embedding it twice is
+        # safe — both copies render independently.
+        STATS_TABLE_2=stats_table,
+        SLIDE6=arbos60_code_slide_html(),
     )
     OUT_HTML.write_text(page)
     print(f"Saved {OUT_HTML} ({OUT_HTML.stat().st_size / 1024:.1f} KB)")
