@@ -1065,18 +1065,32 @@ def tx_resource_stats_html(hist: dict) -> str:
         n_z    = int(hist[f"nzero_{key}_pre"]) + int(hist[f"nzero_{key}_post"])
         n_t    = n_pre + n_post
 
+        z_pre  = int(hist[f"nzero_{key}_pre"])
+        z_post = int(hist[f"nzero_{key}_post"])
+
+        def q(fine, qv):
+            return _percentile_from_hist(fine, edges_fine, qv)
+
         rows.append({
-            "name":        name,
-            "mean_pre":    s_pre / max(n_pre, 1),
-            "mean_post":   s_post / max(n_post, 1),
-            "mean_all":    (s_pre + s_post) / max(n_t, 1),
-            "median_pre":  _percentile_from_hist(fine_pre,  edges_fine, 0.50),
-            "median_post": _percentile_from_hist(fine_post, edges_fine, 0.50),
-            "median_all":  _percentile_from_hist(fine_all,  edges_fine, 0.50),
-            "p25":         _percentile_from_hist(fine_all,  edges_fine, 0.25),
-            "p75":         _percentile_from_hist(fine_all,  edges_fine, 0.75),
-            "p99":         _percentile_from_hist(fine_all,  edges_fine, 0.99),
-            "pct_zero":    100.0 * n_z / max(n_t, 1),
+            "name":           name,
+            "mean_pre":       s_pre / max(n_pre, 1),
+            "mean_post":      s_post / max(n_post, 1),
+            "mean_all":       (s_pre + s_post) / max(n_t, 1),
+            "median_pre":     q(fine_pre,  0.50),
+            "median_post":    q(fine_post, 0.50),
+            "median_all":     q(fine_all,  0.50),
+            "p25_pre":        q(fine_pre,  0.25),
+            "p25_post":       q(fine_post, 0.25),
+            "p25_all":        q(fine_all,  0.25),
+            "p75_pre":        q(fine_pre,  0.75),
+            "p75_post":       q(fine_post, 0.75),
+            "p75_all":        q(fine_all,  0.75),
+            "p99_pre":        q(fine_pre,  0.99),
+            "p99_post":       q(fine_post, 0.99),
+            "p99_all":        q(fine_all,  0.99),
+            "pct_zero_pre":   100.0 * z_pre  / max(n_pre,  1),
+            "pct_zero_post":  100.0 * z_post / max(n_post, 1),
+            "pct_zero_all":   100.0 * n_z    / max(n_t,    1),
         })
         n_grand_total = max(n_grand_total, n_t)
     n = n_grand_total
@@ -1096,9 +1110,8 @@ def tx_resource_stats_html(hist: dict) -> str:
         return f'<td class="{cls}">{fmt(v)}</td>'
 
     # Two-row header: top groups Mean / Median into Pre / Post / All
-    # tri-columns, with the other percentile / %zero columns spanning
-    # both rows.  Visual separators between regime groups so the eye
-    # parses the tri-cells without confusion.
+    # tri-columns; P25 / P75 / P99 / %zero stay as single all-time
+    # columns spanning both rows (rolled back from the wider variant).
     head = (
         '<thead>'
         '  <tr>'
@@ -1132,10 +1145,10 @@ def tx_resource_stats_html(hist: dict) -> str:
             f'{cell(r["median_pre"])}'
             f'{cell(r["median_post"])}'
             f'{cell(r["median_all"], extra="bold")}'
-            f'{cell(r["p25"])}'
-            f'{cell(r["p75"])}'
-            f'{cell(r["p99"])}'
-            f'<td class="num">{r["pct_zero"]:.1f}%</td>'
+            f'{cell(r["p25_all"])}'
+            f'{cell(r["p75_all"])}'
+            f'{cell(r["p99_all"])}'
+            f'<td class="num">{r["pct_zero_all"]:.1f}%</td>'
             f'</tr>'
         )
     table = (
@@ -1347,7 +1360,10 @@ PAGE_TEMPLATE = """<!doctype html>
     .stat-grid .val   {{ color: #111; font-weight: 500;
                          font-variant-numeric: tabular-nums; }}
 
-    .plotly-frame {{ width: 100%; height: 78vh; }}
+    /* Slide-scoped pixel heights, NOT viewport-scoped — reveal scales
+       these correctly with the slide.  `vh` blows past slide bounds on
+       tall monitors. */
+    .plotly-frame {{ width: 100%; height: 850px; }}
     .reveal .plotly-graph-div {{ width: 100% !important;
                                   height: 100% !important; }}
 
@@ -1438,8 +1454,43 @@ PAGE_TEMPLATE = """<!doctype html>
       line-height: 1.5; margin: 0.4em 0 0.6em;
     }}
     .hist-grid {{
-      width: 100%; height: 42vh;
+      width: 100%; height: 580px;
       margin: 0.4em 0 0.8em;
+    }}
+
+    /* Slides that pair a chart with a caption + stats table beneath it.
+       Use flexbox so the chart absorbs whatever height is left after
+       the title block + caption + table.  Selector uses `.slides
+       section.chart-stats-slide` (no `>`) so nested sections — i.e. the
+       vertical-pair wrapper for slides 5a/5b — also match. */
+    .reveal .slides section.chart-stats-slide,
+    .reveal .slides section.chart-stats-slide.present {{
+      display: flex !important;
+      flex-direction: column !important;
+      height: 100% !important;
+      padding: 0 !important;
+      box-sizing: border-box !important;
+      overflow: hidden !important;
+    }}
+    .reveal .slides section.chart-stats-slide > h2,
+    .reveal .slides section.chart-stats-slide > h3,
+    .reveal .slides section.chart-stats-slide > .stats-caption,
+    .reveal .slides section.chart-stats-slide > table.stats-table {{
+      flex: 0 0 auto !important;
+    }}
+    .reveal .slides section.chart-stats-slide > .hist-grid {{
+      flex: 1 1 0 !important;
+      height: auto !important;
+      min-height: 0 !important;
+      margin: 0.3em 0 0.5em !important;
+      position: relative !important;
+      overflow: hidden !important;
+    }}
+    .reveal .slides section.chart-stats-slide > .hist-grid > div {{
+      position: absolute !important;
+      inset: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
     }}
     table.stats-table {{
       border-collapse: collapse; font-size: 0.62em;
@@ -1737,15 +1788,15 @@ PAGE_TEMPLATE = """<!doctype html>
       opacity: 0.92;
     }}
 
-    .reveal section.cover {{ padding-top: 4vh; position: relative; }}
+    .reveal section.cover {{ padding-top: 40px; position: relative; }}
     .reveal section.cover h1 {{ font-size: 2.4em; margin-bottom: 0.1em; }}
     .reveal section.cover h2 {{ font-size: 1.5em; color: #555;
                                   font-weight: 400; }}
-    .reveal section.cover .logo-row {{ margin-top: 6vh; gap: 4em; }}
+    .reveal section.cover .logo-row {{ margin-top: 60px; gap: 4em; }}
     .reveal section.cover .logo-row img {{ height: 80px; }}
 
     .internal-badge {{
-      position: absolute; top: 1.5vh; right: 0;
+      position: absolute; top: 16px; right: 0;
       font-size: 0.55em; font-weight: 600; letter-spacing: 0.18em;
       color: #b54a00; border: 1.5px solid #b54a00;
       padding: 0.25em 0.7em; border-radius: 3px;
@@ -1833,12 +1884,12 @@ PAGE_TEMPLATE = """<!doctype html>
 
     <!-- Slide 5: per-tx gas distribution (vertical pair) -->
     <section>
-      <section>
+      <section class="chart-stats-slide">
         <h2>Per-transaction gas distribution</h2>
         <div class="hist-grid">{HIST_FIG}</div>
         {STATS_TABLE}
       </section>
-      <section>
+      <section class="chart-stats-slide">
         <h2>Per-transaction gas distribution</h2>
         <div class="hist-grid">{VIOLIN_FIG}</div>
         {STATS_TABLE_2}
@@ -1859,7 +1910,7 @@ PAGE_TEMPLATE = """<!doctype html>
     progress: true,
     slideNumber: 'c/t',
     width: 1400,
-    height: 880,
+    height: 1080,
     margin: 0.04,
     transition: 'fade',
   }});
