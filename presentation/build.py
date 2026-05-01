@@ -429,6 +429,72 @@ def load_or_build_tx_sample() -> pl.DataFrame:
     return s
 
 
+def load_taylor_figure() -> str:
+    """Read the standalone arbos51_taylor_comparison.html and return just
+    the plotly <div> + script.  Prefer this over re-running the 35 s × 4
+    sim every time the deck builds."""
+    src = _ROOT / "figures" / "arbos51_taylor_comparison.html"
+    if not src.exists():
+        return ('<div style="padding:1em;color:#a00;">'
+                f'figure not built yet — run '
+                '<code>python scripts/arbos51_taylor_comparison.py</code></div>')
+    html = src.read_text()
+    # Extract the body content (everything inside <body>...</body>).
+    import re
+    m = re.search(r"<body[^>]*>(.*)</body>", html, re.DOTALL)
+    return m.group(1) if m else html
+
+
+def load_taylor_stats_table() -> str:
+    """Render the Δ%-vs-Taylor-4 stats table from the JSON the comparison
+    script writes.  Returns an empty string if the JSON isn't there yet
+    (the script hasn't been run since the last refactor)."""
+    import json
+    src = _ROOT / "data" / "arbos51_taylor_stats.json"
+    if not src.exists():
+        return ""
+    blob = json.loads(src.read_text())
+    rows = blob["rows"]
+    label = {"taylor5": "Taylor-5", "taylor6": "Taylor-6", "exp": "true exp"}
+
+    head = (
+        '<thead><tr>'
+        '<th rowspan="2">Method <span class="hint">(vs Taylor-4)</span></th>'
+        '<th colspan="2" class="grp">Normal hours</th>'
+        '<th colspan="2" class="grp">Peak hours</th>'
+        '</tr><tr>'
+        '<th class="num sub">median</th><th class="num sub">mean</th>'
+        '<th class="num sub">median</th><th class="num sub">mean</th>'
+        '</tr></thead>'
+    )
+
+    def cell(v):
+        return f'<td class="num">{v:+.2f}%</td>'
+
+    body_rows = []
+    for r in rows:
+        body_rows.append(
+            f'<tr><td>{label[r["method"]]}</td>'
+            f'{cell(r["median_normal"])}{cell(r["mean_normal"])}'
+            f'{cell(r["median_peak"])}{cell(r["mean_peak"])}</tr>'
+        )
+    n_peak = blob["n_peak_hours"]
+    n_total = blob["n_total_hours"]
+    thresh = blob["peak_threshold_eth"]
+    return (
+        '<div class="taylor-stats">'
+        '  <div class="taylor-stats-caption">'
+        f'    Δ% of hourly L2 fees vs the on-chain Taylor-4 baseline. '
+        f'    Peak hour := observed fee in the top 10 % '
+        f'    (≥ {thresh:.2f} ETH/hour, {n_peak} of {n_total} hours).'
+        '  </div>'
+        '  <table class="stats-table">'
+        f'   {head}<tbody>{"".join(body_rows)}</tbody>'
+        '  </table>'
+        '</div>'
+    )
+
+
 def arbos60_code_slide_html() -> str:
     """Slide 6: spec block on top (p_min, constraint inequality, per-set
     weight + ladder tables) followed by the code blocks pairing each
@@ -644,10 +710,6 @@ def arbos60_code_slide_html() -> str:
         '</div>'
     )
 
-    github_url = (
-        "https://github.com/Entropy-Advisors/arbos60_dynamic_pricing_sim"
-        "/blob/main/scripts/arbos60.py"
-    )
     github_icon = (
         '<svg class="gh-icon" viewBox="0 0 16 16" width="14" height="14" '
         'fill="currentColor" aria-hidden="true">'
@@ -662,6 +724,47 @@ def arbos60_code_slide_html() -> str:
         '.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-'
         '4.42-3.58-8-8-8z"/></svg>'
     )
+    arbos51_github_url = (
+        "https://github.com/Entropy-Advisors/arbos60_dynamic_pricing_sim"
+        "/blob/main/scripts/arbos51.py"
+    )
+    arbos51_source_link = (
+        '<div class="source-link">'
+        f'  <a href="{arbos51_github_url}" target="_blank" rel="noopener">'
+        f'    {github_icon}'
+        '    <span>scripts/arbos51.py on GitHub</span>'
+        '  </a>'
+        '</div>'
+    )
+    arbos51_taylor_section = (
+        '<section class="chart-stats-slide">'
+        '  <h2>ArbOS 51 also implemented in code</h2>'
+        '  <div class="ladder-row">'
+        '    <table class="ladder-table"><thead>'
+        '      <tr><th>j</th><th>0</th><th>1</th><th>2</th>'
+        '          <th>3</th><th>4</th><th>5</th></tr>'
+        '    </thead><tbody>'
+        '      <tr><th>T<sub>j</sub> (Mgas/s)</th>'
+        '          <td>10</td><td>14</td><td>20</td>'
+        '          <td>29</td><td>41</td><td>60</td></tr>'
+        '      <tr><th>A<sub>j</sub> (s)</th>'
+        '          <td>86,400</td><td>13,485</td><td>2,105</td>'
+        '          <td>329</td><td>52</td><td>9</td></tr>'
+        '    </tbody></table>'
+        '    <div class="ladder-caption">'
+        '      ArbOS 51 DIA ladder: 6 constraints (T<sub>j</sub> = drain rate, '
+        '      A<sub>j</sub> = response time).'
+        '    </div>'
+        '  </div>'
+        f' <div class="hist-grid">{load_taylor_figure()}</div>'
+        f' {arbos51_source_link}'
+        '</section>'
+    )
+
+    github_url = (
+        "https://github.com/Entropy-Advisors/arbos60_dynamic_pricing_sim"
+        "/blob/main/scripts/arbos60.py"
+    )
     source_link = (
         '<div class="source-link">'
         f'  <a href="{github_url}" target="_blank" rel="noopener">'
@@ -670,7 +773,8 @@ def arbos60_code_slide_html() -> str:
         '  </a>'
         '</div>'
     )
-    # Two nested <section>s = a vertical-slide pair so each half breathes.
+    # Three nested <section>s = a vertical group: ArbOS 60 spec → ArbOS 60
+    # class methods → ArbOS 51 implementation + Taylor comparison.
     return (
         '<section>\n'
         '  <section>\n'
@@ -685,6 +789,7 @@ def arbos60_code_slide_html() -> str:
         '    </div>\n'
         f'    {source_link}\n'
         '  </section>\n'
+        f'  {arbos51_taylor_section}\n'
         '</section>'
     )
 
@@ -1646,6 +1751,65 @@ PAGE_TEMPLATE = """<!doctype html>
                    margin-left: 0.25em; }}
     .const-sep  {{ color: #aaa; margin: 0 0.45em; }}
 
+    /* Slide 8 — DIA ladder reminder at top of slide. */
+    .ladder-row {{
+      display: flex; align-items: center;
+      justify-content: center; gap: 1.4em;
+      margin: 0.3em auto 0.5em;
+    }}
+    table.ladder-table {{
+      border-collapse: collapse; font-size: 0.6em;
+      color: #111; margin: 0;
+    }}
+    table.ladder-table th, table.ladder-table td {{
+      padding: 0.32em 0.85em;
+      border-bottom: 1px solid #e0e0e0;
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+    }}
+    table.ladder-table thead th {{
+      background: #f4f4f4;
+      border-bottom: 2px solid #333;
+      font-weight: 600; color: #111;
+    }}
+    table.ladder-table tbody th {{
+      background: #fafafa;
+      text-align: right;
+      font-weight: 600; color: #111;
+      border-right: 1px solid #d0d0d0;
+    }}
+    .ladder-caption {{
+      font-size: 0.55em; color: #666; line-height: 1.45;
+      max-width: 360px;
+    }}
+
+    /* Slide 8 — short Taylor-4 explainer above the comparison chart. */
+    .taylor-note {{
+      font-size: 0.6em; color: #444; line-height: 1.5;
+      max-width: 1200px; margin: 0.3em 0 0.5em;
+      padding: 0.55em 0.85em;
+      background: rgba(214, 39, 40, 0.04);
+      border-left: 3px solid #d62728;
+      border-radius: 2px;
+    }}
+    .taylor-note code {{
+      background: rgba(255,255,255,0.7);
+      padding: 1px 4px; border-radius: 2px;
+      font-size: 0.95em;
+    }}
+    .taylor-note b {{ color: #d62728; }}
+
+    /* Stats table at the foot of slide 8. */
+    .taylor-stats {{ margin-top: 0.5em; }}
+    .taylor-stats-caption {{
+      font-size: 0.55em; color: #666; margin-bottom: 0.3em;
+      line-height: 1.4;
+    }}
+    .taylor-stats .hint {{
+      font-weight: 400; color: #888;
+      text-transform: none; letter-spacing: 0;
+    }}
+
     /* Resource-symbol notation block on slide 7a. */
     .notation-block {{
       display: flex; flex-wrap: wrap;
@@ -1935,7 +2099,7 @@ PAGE_TEMPLATE = """<!doctype html>
       </section>
     </section>
 
-    <!-- Slide 6: ArbOS 60 implementation -->
+    <!-- Slide 6: ArbOS 60 + ArbOS 51 implementations (vertical group) -->
     {SLIDE6}
 
   </div>

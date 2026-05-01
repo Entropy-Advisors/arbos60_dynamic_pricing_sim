@@ -69,20 +69,35 @@ class Arbos51GasPricing:
     PRE_DIA_LADDER: list[tuple[float, int]] = [(7.0, 102)]
     PRE_DIA_P_MIN_GWEI: float = 0.01
 
+    # Allowed exp approximations.  `"taylor4"` is the on-chain default
+    # (matches nitro's `ApproxExpBasisPoints(x, 4)`); higher-order Taylor
+    # and true `exp` are exposed for diagnostic comparisons.
+    _EXP_METHODS: tuple[str, ...] = ("exp", "taylor4", "taylor5", "taylor6")
+
     def __init__(
         self,
         ladder: list[tuple[float, int]] | None = None,
         p_min_gwei: float | None = None,
+        exp_method: str = "taylor4",
     ):
         self.ladder     = ladder     if ladder     is not None else self.LADDER
         self.p_min_gwei = p_min_gwei if p_min_gwei is not None else self.P_MIN_GWEI
+        if exp_method not in self._EXP_METHODS:
+            raise ValueError(
+                f"exp_method must be one of {self._EXP_METHODS}, got {exp_method!r}"
+            )
+        self.exp_method = exp_method
 
     @classmethod
-    def pre_dia(cls) -> "Arbos51GasPricing":
+    def pre_dia(cls, exp_method: str = "taylor4") -> "Arbos51GasPricing":
         """Pre-Dia engine: single (T = 7 Mgas/s, A = 102 s) constraint and
         p_min = 0.01 gwei. Same backlog/exp machinery as Dia, just one
         constraint and a lower floor."""
-        return cls(ladder=cls.PRE_DIA_LADDER, p_min_gwei=cls.PRE_DIA_P_MIN_GWEI)
+        return cls(
+            ladder=cls.PRE_DIA_LADDER,
+            p_min_gwei=cls.PRE_DIA_P_MIN_GWEI,
+            exp_method=exp_method,
+        )
 
     # ── 2. Time / aggregation helpers ───────────────────────────────────────
     @staticmethod
@@ -118,7 +133,7 @@ class Arbos51GasPricing:
         )
         return t_axis, summed
 
-    # ── 3. Exp approximation (matches Nitro `model.go`) ─────────────────────
+    # ── 3. Exp approximation (matches Nitro `model.go` at degree 4) ─────────
     @staticmethod
     def taylor4_exp(x: np.ndarray) -> np.ndarray:
         """Degree-4 Taylor approximation of exp.
@@ -128,6 +143,43 @@ class Arbos51GasPricing:
         x3 = x2 * x
         x4 = x2 * x2
         return 1.0 + x + x2 / 2.0 + x3 / 6.0 + x4 / 24.0
+
+    @staticmethod
+    def taylor5_exp(x: np.ndarray) -> np.ndarray:
+        """Degree-5 Taylor approximation — diagnostic only.  Matches
+        `ApproxExpBasisPoints(x, 5)`.  Not used on-chain."""
+        x2 = x * x
+        x3 = x2 * x
+        x4 = x2 * x2
+        x5 = x4 * x
+        return 1.0 + x + x2 / 2.0 + x3 / 6.0 + x4 / 24.0 + x5 / 120.0
+
+    @staticmethod
+    def taylor6_exp(x: np.ndarray) -> np.ndarray:
+        """Degree-6 Taylor approximation — diagnostic only."""
+        x2 = x * x
+        x3 = x2 * x
+        x4 = x2 * x2
+        x5 = x4 * x
+        x6 = x4 * x2
+        return (1.0 + x + x2 / 2.0 + x3 / 6.0 + x4 / 24.0
+                + x5 / 120.0 + x6 / 720.0)
+
+    @staticmethod
+    def exp_exact(x: np.ndarray) -> np.ndarray:
+        """True np.exp — diagnostic upper bound.  The on-chain implementation
+        cannot use this because Solidity has no fixed-point exp; arbos uses
+        the Taylor-4 approximation instead."""
+        return np.exp(x)
+
+    def _exp(self, x: np.ndarray) -> np.ndarray:
+        """Dispatch to the configured approximation."""
+        return {
+            "exp":     self.exp_exact,
+            "taylor4": self.taylor4_exp,
+            "taylor5": self.taylor5_exp,
+            "taylor6": self.taylor6_exp,
+        }[self.exp_method](x)
 
     # ── 4. Inflow per t (single-set: just g_total aggregated) ──────────────
     def compute_inflow_per_t(
@@ -197,10 +249,12 @@ class Arbos51GasPricing:
         # fold over j → shape (n_t,).
         E = (B_j / (A_j * T_j * 1e6)[:, None]).sum(axis=0)
 
-        # p(t) = p_min · taylor4_exp(E(t)).  E(t) ≥ 0 by construction
+        # p(t) = p_min · approx_exp(E(t)).  E(t) ≥ 0 by construction
         # (B, A, T all non-negative), so no max(0, …) clip is needed.
-        # taylor4_exp(0) = 1, monotone on [0, ∞), so p ≥ p_min always.
-        p_per_t = self.p_min_gwei * self.taylor4_exp(E)
+        # All exp approximations satisfy approx(0) = 1 and are monotone
+        # on [0, ∞), so p ≥ p_min always.  Default approximation is
+        # `taylor4`; can be swapped via `exp_method` for diagnostics.
+        p_per_t = self.p_min_gwei * self._exp(E)
         return t_axis, p_per_t
 
     @classmethod
@@ -208,6 +262,7 @@ class Arbos51GasPricing:
         cls,
         total_gas: np.ndarray,
         block_t: np.ndarray,
+        exp_method: str = "taylor4",
     ) -> tuple[np.ndarray, np.ndarray]:
         """Per-t price honoring the ArbOS 51 Dia activation boundary.
 
@@ -215,7 +270,8 @@ class Arbos51GasPricing:
         pre-Dia engine (single constraint, p_min = 0.01 gwei); blocks at or
         after activation use the Dia engine (6-rung ladder, p_min = 0.02
         gwei).  Backlogs warm up independently per regime — matches the
-        on-chain reset at the upgrade.
+        on-chain reset at the upgrade.  Both regimes use the same
+        `exp_method` so the comparison stays apples-to-apples.
 
         Returns (t_axis, p_per_t) covering the union of both regimes in
         chronological order.  Assumes `block_t` is sorted ascending.
@@ -232,16 +288,18 @@ class Arbos51GasPricing:
 
         # All blocks already at/after activation → pure Dia run, no split needed.
         if split == 0:
-            return cls().price_per_second(total_gas, block_t)
+            return cls(exp_method=exp_method).price_per_second(total_gas, block_t)
         # All blocks before activation → pure pre-Dia run.
         if split == n:
-            return cls.pre_dia().price_per_second(total_gas, block_t)
+            return cls.pre_dia(exp_method=exp_method).price_per_second(total_gas, block_t)
 
         # Mixed window: run each regime on its own slice with its own backlog
         # state (B_j(0) = 0 reset at the upgrade boundary, matching the
         # on-chain reset).  Then concatenate the two output slices.
-        t_pre, p_pre = cls.pre_dia().price_per_second(total_gas[:split], block_t[:split])
-        t_dia, p_dia = cls()        .price_per_second(total_gas[split:], block_t[split:])
+        t_pre, p_pre = cls.pre_dia(exp_method=exp_method).price_per_second(
+            total_gas[:split], block_t[:split])
+        t_dia, p_dia = cls(exp_method=exp_method).price_per_second(
+            total_gas[split:], block_t[split:])
         return (
             np.concatenate([t_pre, t_dia]),     # t axis: pre-Dia then Dia (chronological)
             np.concatenate([p_pre, p_dia]),     # p(t): same order
