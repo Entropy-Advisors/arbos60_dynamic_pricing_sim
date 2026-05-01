@@ -25,7 +25,7 @@ A "saturation" second has headroom_pct(t) < (1 − THRESHOLD) × 100,
 i.e. realised G is at or above THRESHOLD of the capacity ceiling.
 
 Top panel shows the ArbOS 60 simulated prices that come out of
-`arbos60.Arbos60GasPricing.price_per_resource` — the same engine the
+`arbos60.Arbos60GasPricing.price_per_resource` — the samle engine the
 historical-sim chart uses — so you can sanity-check that the prices we
 derive capacity from are the prices our code actually produces.
 """

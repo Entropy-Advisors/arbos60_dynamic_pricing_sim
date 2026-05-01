@@ -154,14 +154,23 @@ def compute_hourly_revenue(use_cache: bool = True) -> pl.DataFrame:
 
 
 def add_pmin_sweep(hourly: pl.DataFrame) -> pl.DataFrame:
-    """Add eth_60_pmin_<X> columns for every p_min in PMIN_SWEEP.
-    p_k(t) = p_min · taylor4_exp(e_k(t)); exponent is independent of p_min,
-    so scaling eth_60 by p_min / PMIN_BASE is exact."""
+    """Add eth_60_pmin_<X> and eth_60_v2_pmin_<X> columns for every
+    p_min in PMIN_SWEEP.  The price formula is
+        p_k(t) = p_min · taylor4_exp(e_k(t))
+    where e_k(t) depends only on inflow vs target (p_min-independent),
+    so revenue is linear in p_min: scaling either set's eth column by
+    p_min / PMIN_BASE is exact."""
     cols = [pl.col(c) for c in hourly.columns]
     for pmin in PMIN_SWEEP:
         scale = pmin / PMIN_BASE
-        col = (pl.col("eth_60") * scale).alias(f"eth_60_pmin_{pmin:g}")
-        cols.append(col)
+        cols.append(
+            (pl.col("eth_60") * scale).alias(f"eth_60_pmin_{pmin:g}")
+        )
+        if "eth_60_v2" in hourly.columns:
+            cols.append(
+                (pl.col("eth_60_v2") * scale)
+                .alias(f"eth_60_v2_pmin_{pmin:g}")
+            )
     return hourly.select(cols)
 
 
@@ -193,6 +202,13 @@ def stats_row(
     d = _window_slice(daily,  "day",  days)
     e51 = float(h["eth_51"].sum())
     e60 = float(h["eth_60"].sum())
+
+    def _std(col: pl.DataFrame, name: str) -> float:
+        if col.height < 2:
+            return 0.0
+        s = float(col[name].std() or 0.0)
+        return s
+
     return {
         "window":             label,
         "n_hours":            h.height,
@@ -204,65 +220,119 @@ def stats_row(
         "mean_hourly_60":     float(h["eth_60"].mean()) if h.height else 0.0,
         "median_hourly_51":   float(h["eth_51"].median()) if h.height else 0.0,
         "median_hourly_60":   float(h["eth_60"].median()) if h.height else 0.0,
+        "std_hourly_51":      _std(h, "eth_51"),
+        "std_hourly_60":      _std(h, "eth_60"),
         "mean_daily_51":      float(d["eth_51"].mean()) if d.height else 0.0,
         "mean_daily_60":      float(d["eth_60"].mean()) if d.height else 0.0,
         "median_daily_51":    float(d["eth_51"].median()) if d.height else 0.0,
         "median_daily_60":    float(d["eth_60"].median()) if d.height else 0.0,
+        "std_daily_51":       _std(d, "eth_51"),
+        "std_daily_60":       _std(d, "eth_60"),
     }
 
 
 def build_stats_table(hourly: pl.DataFrame, daily: pl.DataFrame) -> str:
-    rows = [
+    """Transposed window summary: rows = metrics, columns = windows.
+    Δ ETH and Δ % cells get a green/red heatmap background that scales
+    with the cell's magnitude relative to the row's max abs value."""
+    cols = [
         stats_row(hourly, daily, 7,    "Last 7D"),
         stats_row(hourly, daily, 30,   "Last 30D"),
         stats_row(hourly, daily, 90,   "Last 90D"),
-        stats_row(hourly, daily, None, f"Full window ({daily.height} days)"),
+        stats_row(hourly, daily, None, f"Full ({daily.height}D)"),
     ]
 
     def _eth(x: float) -> str:
-        if abs(x) >= 1000:  return f"{x:,.1f}"
-        if abs(x) >= 10:    return f"{x:,.2f}"
-        return f"{x:.4f}"
+        ax = abs(x)
+        if ax >= 1e6:   return f"{x/1e6:.2f}M"
+        if ax >= 1e3:   return f"{x/1e3:.2f}K"
+        if ax >= 1.0:   return f"{x:.2f}"
+        if ax > 0:      return f"{x:.2g}"
+        return "0"
+
+    def _heat_bg(x: float, scale: float) -> str:
+        """Cell background — green for positive x, red for negative,
+        opacity proportional to |x| / scale.  `!important` overrides
+        Reveal.js's default `.reveal table` row striping."""
+        if scale <= 0 or not np.isfinite(x):
+            return ""
+        a = min(abs(x) / scale, 1.0) * 0.55 + 0.10  # min opacity 0.10
+        if x >= 0:
+            return f"background: rgba(34, 139, 34, {a:.2f}) !important;"
+        return f"background: rgba(214, 39, 40, {a:.2f}) !important;"
 
     th_style = (
-        "padding:6px 10px; border-bottom:2px solid #333; "
-        "background:#f4f4f4; text-align:right; font-size:13px;"
+        "padding:5px 9px; border-bottom:2px solid #333; "
+        "background:#f4f4f4; text-align:right; font-size:12.5px;"
     )
     td_style = (
-        "padding:5px 10px; border-bottom:1px solid #ddd; "
-        "text-align:right; font-size:13px; font-family:monospace;"
+        "padding:7px 12px; border-bottom:1px solid #ddd; "
+        "text-align:right; font-size:12.5px; font-family:monospace;"
     )
-    label_style = td_style + " text-align:left; font-family:inherit;"
+    label_style = (
+        "padding:7px 12px; border-bottom:1px solid #ddd; "
+        "text-align:left; font-size:12.5px; font-weight:600; "
+        "background:#fafafa;"
+    )
 
-    head = (
-        f"<tr><th style='{th_style}; text-align:left'>Window</th>"
-        f"<th style='{th_style}'>Total 51 (ETH)</th>"
-        f"<th style='{th_style}'>Total 60 (ETH)</th>"
-        f"<th style='{th_style}'>Δ ETH</th>"
-        f"<th style='{th_style}'>Δ %</th>"
-        f"<th style='{th_style}'>Hourly mean 51 / 60</th>"
-        f"<th style='{th_style}'>Hourly median 51 / 60</th>"
-        f"<th style='{th_style}'>Daily mean 51 / 60</th>"
-        f"<th style='{th_style}'>Daily median 51 / 60</th></tr>"
-    )
+    # Metric rows: (label, formatter, heat?, value_func).  Each entry
+    # produces one HTML row; cells are computed by calling value_func(c).
+    metrics = [
+        ("Total 51 (ETH)",         lambda c: c["total_eth_51"],     False),
+        ("Total 60 (ETH)",         lambda c: c["total_eth_60"],     False),
+        ("Δ ETH (60 − 51)",        lambda c: c["delta_eth"],        True),
+        ("Δ %",                    lambda c: c["delta_pct"],        True),
+        ("Hourly mean 51 / 60",    lambda c: (c["mean_hourly_51"],   c["mean_hourly_60"]),   "pair"),
+        ("Hourly median 51 / 60",  lambda c: (c["median_hourly_51"], c["median_hourly_60"]), "pair"),
+        ("Hourly σ 51 / 60",       lambda c: (c["std_hourly_51"],    c["std_hourly_60"]),    "pair"),
+        ("Daily mean 51 / 60",     lambda c: (c["mean_daily_51"],    c["mean_daily_60"]),    "pair"),
+        ("Daily median 51 / 60",   lambda c: (c["median_daily_51"],  c["median_daily_60"]),  "pair"),
+        ("Daily σ 51 / 60",        lambda c: (c["std_daily_51"],     c["std_daily_60"]),     "pair"),
+    ]
+
+    # Header row.
+    head_cells = [f"<th style='{th_style}; text-align:left'>Metric</th>"]
+    for c in cols:
+        head_cells.append(f"<th style='{th_style}'>{c['window']}</th>")
+    head = "<tr>" + "".join(head_cells) + "</tr>"
+
     body = []
-    for r in rows:
-        body.append(
-            f"<tr>"
-            f"<td style='{label_style}'>{r['window']}</td>"
-            f"<td style='{td_style}'>{_eth(r['total_eth_51'])}</td>"
-            f"<td style='{td_style}'>{_eth(r['total_eth_60'])}</td>"
-            f"<td style='{td_style}'>{_eth(r['delta_eth'])}</td>"
-            f"<td style='{td_style}'>{r['delta_pct']:+.1f}%</td>"
-            f"<td style='{td_style}'>{_eth(r['mean_hourly_51'])} / {_eth(r['mean_hourly_60'])}</td>"
-            f"<td style='{td_style}'>{_eth(r['median_hourly_51'])} / {_eth(r['median_hourly_60'])}</td>"
-            f"<td style='{td_style}'>{_eth(r['mean_daily_51'])} / {_eth(r['mean_daily_60'])}</td>"
-            f"<td style='{td_style}'>{_eth(r['median_daily_51'])} / {_eth(r['median_daily_60'])}</td>"
-            f"</tr>"
-        )
+    for label, fn, heat in metrics:
+        if heat == "pair":
+            cells = [f"<td style='{label_style}'>{label}</td>"]
+            for c in cols:
+                a, b = fn(c)
+                cells.append(
+                    f"<td style='{td_style}'>{_eth(a)} / {_eth(b)}</td>"
+                )
+        elif heat is True:
+            # Compute scale from the row's max absolute value across
+            # windows so colour intensity is comparable cell-to-cell.
+            vals = [fn(c) for c in cols]
+            scale = max((abs(v) for v in vals if np.isfinite(v)),
+                        default=1.0) or 1.0
+            cells = [f"<td style='{label_style}'>{label}</td>"]
+            for v in vals:
+                bg = _heat_bg(v, scale)
+                if label.startswith("Δ %"):
+                    txt = f"{v:+.1f}%"
+                else:
+                    sign = "+" if v >= 0 else "-"
+                    txt = sign + _eth(abs(v))
+                cells.append(
+                    f"<td style='{td_style} {bg}'>{txt}</td>"
+                )
+        else:
+            cells = [f"<td style='{label_style}'>{label}</td>"]
+            for c in cols:
+                cells.append(
+                    f"<td style='{td_style}'>{_eth(fn(c))}</td>"
+                )
+        body.append("<tr>" + "".join(cells) + "</tr>")
+
     return (
         "<table style='border-collapse:collapse; margin:20px auto; "
-        "max-width:1400px; box-shadow:0 1px 3px rgba(0,0,0,0.08);'>"
+        "max-width:1100px; box-shadow:0 1px 3px rgba(0,0,0,0.08);'>"
         + head + "".join(body) + "</table>"
     )
 
@@ -580,36 +650,98 @@ def build_pmin_sweep_table(hourly: pl.DataFrame) -> str:
     p_min sweep + ArbOS 60 set 2 (default p_min)."""
     e51 = float(hourly["eth_51"].sum())
     e60v2 = float(hourly["eth_60_v2"].sum())
-    th = ("padding:6px 10px; border-bottom:2px solid #333; "
-          "background:#f4f4f4; text-align:right; font-size:13px;")
-    td = ("padding:5px 10px; border-bottom:1px solid #ddd; "
-          "text-align:right; font-size:13px; font-family:monospace;")
-    label = td + " text-align:left; font-family:inherit;"
 
-    rows = [
-        f"<tr><td style='{label}'>ArbOS 51 (baseline)</td>"
-        f"<td style='{td}'>{e51:,.2f}</td>"
-        f"<td style='{td}'>—</td><td style='{td}'>—</td></tr>"
+    def _eth(x: float) -> str:
+        """Compact ETH formatting: at most 2 significant decimals,
+        K/M suffixes for large totals."""
+        ax = abs(x)
+        if ax >= 1e6:   return f"{x/1e6:.2f}M"
+        if ax >= 1e3:   return f"{x/1e3:.2f}K"
+        if ax >= 1.0:   return f"{x:.2f}"
+        if ax > 0:      return f"{x:.2g}"
+        return "0"
+
+    def _signed_eth(x: float) -> str:
+        ax = abs(x)
+        sign = "+" if x >= 0 else "-"
+        if ax >= 1e6:   return f"{sign}{ax/1e6:.2f}M"
+        if ax >= 1e3:   return f"{sign}{ax/1e3:.2f}K"
+        if ax >= 1.0:   return f"{sign}{ax:.2f}"
+        return f"{sign}{ax:.2g}"
+
+    th = ("padding:5px 9px; border-bottom:2px solid #333; "
+          "background:#f4f4f4; text-align:right; font-size:12.5px;")
+    td = ("padding:7px 12px; border-bottom:1px solid #ddd; "
+          "text-align:right; font-size:12.5px; font-family:monospace;")
+    label = td + " text-align:left; font-family:inherit; font-weight:500;"
+
+    # Daily volatility (std-dev of daily ETH) per regime.
+    daily_full = hourly_to_daily(hourly)
+    vol_51   = float(daily_full["eth_51"].std() or 0.0)
+    vol_60v2 = float(daily_full["eth_60_v2"].std() or 0.0) if "eth_60_v2" in daily_full.columns else 0.0
+
+    # Pre-collect rows to compute heatmap scales over the whole table.
+    raw_rows = [
+        ("ArbOS 51 (baseline)", e51, None, None, vol_51),
     ]
     for pmin in PMIN_SWEEP:
         e = float(hourly[f"eth_60_pmin_{pmin:g}"].sum())
+        vol = float(daily_full[f"eth_60_pmin_{pmin:g}"].std() or 0.0)
+        raw_rows.append((
+            f"ArbOS 60 set 1 · p_min = {pmin:.2f} gwei",
+            e, e - e51, (e - e51) / e51 * 100, vol,
+        ))
+    if "eth_60_v2_pmin_0.02" in hourly.columns:
+        for pmin in PMIN_SWEEP:
+            e = float(hourly[f"eth_60_v2_pmin_{pmin:g}"].sum())
+            vol = float(daily_full[f"eth_60_v2_pmin_{pmin:g}"].std() or 0.0)
+            raw_rows.append((
+                f"ArbOS 60 <b>set 2</b> · p_min = {pmin:.2f} gwei",
+                e, e - e51, (e - e51) / e51 * 100, vol,
+            ))
+    else:
+        raw_rows.append((
+            "ArbOS 60 <b>set 2</b> · p_min = 0.02 gwei",
+            e60v2, e60v2 - e51,
+            (e60v2 - e51) / e51 * 100, vol_60v2,
+        ))
+
+    delta_eth_scale = max(
+        (abs(r[2]) for r in raw_rows if r[2] is not None),
+        default=1.0,
+    ) or 1.0
+    delta_pct_scale = max(
+        (abs(r[3]) for r in raw_rows if r[3] is not None),
+        default=1.0,
+    ) or 1.0
+
+    def _heat_bg(x: float | None, scale: float) -> str:
+        if x is None or scale <= 0:
+            return ""
+        a = min(abs(x) / scale, 1.0) * 0.55 + 0.10
+        if x >= 0:
+            return f"background: rgba(34, 139, 34, {a:.2f}) !important;"
+        return f"background: rgba(214, 39, 40, {a:.2f}) !important;"
+
+    rows = []
+    for name, eth, d_eth, d_pct, vol in raw_rows:
+        d_eth_cell = "—" if d_eth is None else _signed_eth(d_eth)
+        d_pct_cell = "—" if d_pct is None else f"{d_pct:+.1f}%"
+        bg_eth = _heat_bg(d_eth, delta_eth_scale)
+        bg_pct = _heat_bg(d_pct, delta_pct_scale)
         rows.append(
-            f"<tr><td style='{label}'>ArbOS 60 set 1 · p_min = {pmin:.2f} gwei</td>"
-            f"<td style='{td}'>{e:,.2f}</td>"
-            f"<td style='{td}'>{e - e51:+,.2f}</td>"
-            f"<td style='{td}'>{(e - e51)/e51*100:+.1f}%</td></tr>"
+            f"<tr><td style='{label}'>{name}</td>"
+            f"<td style='{td}'>{_eth(eth)}</td>"
+            f"<td style='{td} {bg_eth}'>{d_eth_cell}</td>"
+            f"<td style='{td} {bg_pct}'>{d_pct_cell}</td>"
+            f"<td style='{td}'>{_eth(vol)}</td></tr>"
         )
-    rows.append(
-        f"<tr><td style='{label}'>ArbOS 60 <b>set 2</b> · p_min = 0.02 gwei</td>"
-        f"<td style='{td}'>{e60v2:,.2f}</td>"
-        f"<td style='{td}'>{e60v2 - e51:+,.2f}</td>"
-        f"<td style='{td}'>{(e60v2 - e51)/e51*100:+.1f}%</td></tr>"
-    )
     head = (
         f"<tr><th style='{th}; text-align:left'>Regime</th>"
         f"<th style='{th}'>Total ETH (full window)</th>"
         f"<th style='{th}'>Δ vs 51</th>"
-        f"<th style='{th}'>Δ %</th></tr>"
+        f"<th style='{th}'>Δ %</th>"
+        f"<th style='{th}'>Daily σ (ETH)</th></tr>"
     )
     return (
         "<table style='border-collapse:collapse; margin:20px auto; "

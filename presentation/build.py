@@ -823,10 +823,58 @@ def _cumulative_panel(
         ), row=row, col=col)
 
 
+def _performance_panel(
+    fig, daily: pl.DataFrame, *,
+    baseline_col: str,
+    series: list[tuple[str, str, str, str]],
+    row: int, col: int,
+    show_legend: bool,
+):
+    """Cumulative % delta of each regime over ArbOS 51, normalised by
+    the slice's final ArbOS 51 cumulative so the line starts at 0 %
+    (both regimes had 0 ETH before day 1) and traces the running
+    excess as a % of the slice's total ArbOS 51 revenue:
+        y(t) = (cum_X(t) − cum_51(t)) / cum_51(slice end) × 100
+    ArbOS 51 stays flat at 0 %.  The other lines start at 0 % and
+    widen toward the final % gain by the slice end."""
+    days = daily["day"].to_list()
+    cum_base = daily[baseline_col].cum_sum().to_numpy().astype(np.float64)
+    final_base = float(cum_base[-1]) if len(cum_base) and cum_base[-1] > 0 else 1.0
+
+    # Prepend a day-0 anchor at 0 ETH gap so every line literally
+    # starts on the chart at 0 %.
+    if len(days):
+        first_day = days[0]
+        try:
+            anchor_day = first_day - timedelta(days=1)
+        except Exception:
+            anchor_day = first_day
+    x = [anchor_day] + days if len(days) else days
+
+    for column, label, colour, dash in series:
+        if column == baseline_col:
+            y_inner = np.zeros_like(cum_base)
+        else:
+            cum = daily[column].cum_sum().to_numpy().astype(np.float64)
+            y_inner = (cum - cum_base) / final_base * 100.0
+        y = np.concatenate([[0.0], y_inner]) if len(days) else y_inner
+        fig.add_trace(go.Scatter(
+            x=x, y=y, name=label, mode="lines",
+            line=dict(color=colour, width=1.8, dash=dash),
+            legendgroup=label, showlegend=show_legend,
+            hovertemplate=(
+                "%{x|%Y-%m-%d}<br>"
+                f"{label}: " "%{y:+.2f}% of slice 51 revenue<extra></extra>"
+            ),
+        ), row=row, col=col)
+
+
 def fig_cum_revenue_overview(hourly: pl.DataFrame) -> go.Figure:
-    """Three-panel cumulative ETH revenue: Full window | Last 90 days |
-    Last 30 days.  ArbOS 51 vs ArbOS 60 set 1 vs ArbOS 60 set 2.  All
-    three lines start at 0 ETH on the first day of each slice."""
+    """2 rows × 3 cols cumulative ETH revenue.
+        Row 1: cumulative ETH (Full / 90D / 30D), all lines start at 0 ETH.
+        Row 2: cumulative performance (% gain vs ArbOS 51), all lines
+               start at 0 % on the first day of the slice.
+    ArbOS 51 vs ArbOS 60 set 1 vs ArbOS 60 set 2."""
     if "cum_overview" in _REVENUE_FIG_CACHE:
         return _REVENUE_FIG_CACHE["cum_overview"]
 
@@ -844,16 +892,29 @@ def fig_cum_revenue_overview(hourly: pl.DataFrame) -> go.Figure:
         ("eth_60_v2", "ArbOS 60 set 2",  "#17becf", "dash"),
     ]
     fig = make_subplots(
-        rows=1, cols=3,
-        subplot_titles=("Full window", "Last 90 days", "Last 30 days"),
-        horizontal_spacing=0.07,
+        rows=2, cols=3,
+        subplot_titles=(
+            "Last 30 days", "Last 90 days", "Full window",
+            "", "", "",
+        ),
+        horizontal_spacing=0.07, vertical_spacing=0.12,
+        row_heights=[0.55, 0.45],
     )
-    _cumulative_panel(fig, daily,    series=series,
+    # Columns: 30d (left) | 90d (middle) | full window (right).
+    # Row 1 — cumulative ETH.
+    _cumulative_panel(fig, daily_30, series=series,
                       row=1, col=1, show_legend=True)
     _cumulative_panel(fig, daily_90, series=series,
                       row=1, col=2, show_legend=False)
-    _cumulative_panel(fig, daily_30, series=series,
+    _cumulative_panel(fig, daily,    series=series,
                       row=1, col=3, show_legend=False)
+    # Row 2 — performance (% gain vs ArbOS 51).
+    _performance_panel(fig, daily_30, baseline_col="eth_51",
+                       series=series, row=2, col=1, show_legend=False)
+    _performance_panel(fig, daily_90, baseline_col="eth_51",
+                       series=series, row=2, col=2, show_legend=False)
+    _performance_panel(fig, daily,    baseline_col="eth_51",
+                       series=series, row=2, col=3, show_legend=False)
 
     for c in (1, 2, 3):
         fig.update_yaxes(
@@ -861,11 +922,20 @@ def fig_cum_revenue_overview(hourly: pl.DataFrame) -> go.Figure:
             showline=True, linewidth=1.0, linecolor="rgba(0,0,0,0.45)",
             mirror=True, ticks="outside", row=1, col=c,
         )
+        fig.update_yaxes(
+            title_text=("% gain vs ArbOS 51" if c == 1 else ""),
+            ticksuffix="%",
+            showline=True, linewidth=1.0, linecolor="rgba(0,0,0,0.45)",
+            mirror=True, ticks="outside", row=2, col=c,
+        )
         fig.update_xaxes(showline=True, linewidth=1.0,
                           linecolor="rgba(0,0,0,0.45)",
                           mirror=True, ticks="outside", row=1, col=c)
+        fig.update_xaxes(showline=True, linewidth=1.0,
+                          linecolor="rgba(0,0,0,0.45)",
+                          mirror=True, ticks="outside", row=2, col=c)
     fig.update_layout(
-        template="plotly_white", autosize=True, height=520,
+        template="plotly_white", autosize=True, height=720,
         margin=dict(l=70, r=30, t=70, b=50),
         font=dict(size=12, color="#222"),
         hovermode="x",
@@ -976,16 +1046,66 @@ def fig_revenue_timeseries(hourly: pl.DataFrame,
 
 
 def fig_cum_grid(daily: pl.DataFrame) -> go.Figure:
-    """4 periods × 4 p_min cumulative ETH grid (uses
-    revenue_no_elasticity.build_cumulative_grid then strips the inner
-    title so the slide H2 reads cleanly)."""
+    """4 periods × 4 p_min cumulative ETH grid.  Subplot titles trimmed
+    to just "p_min = X gwei" on the top row + a row-label annotation on
+    the left edge of each row, so titles don't collide with axis labels."""
     if "cum_grid" in _REVENUE_FIG_CACHE:
         return _REVENUE_FIG_CACHE["cum_grid"]
     import revenue_no_elasticity as rne                           # noqa: E402
     fig = rne.build_cumulative_grid(daily)
+
+    n_rows = len(rne.CUM_PERIODS)
+    n_cols = len(rne.PMIN_SWEEP)
+    new_titles: list[str] = []
+    for r in range(n_rows):
+        for c, pmin in enumerate(rne.PMIN_SWEEP):
+            # Only the top row gets the p_min label; lower rows blank.
+            new_titles.append(f"p<sub>min</sub> = {pmin:.2f} gwei"
+                              if r == 0 else "")
+    # Walk fig.layout.annotations to find subplot-title annotations and
+    # rewrite their text in row-major order.
+    if fig.layout.annotations:
+        title_anns = [a for a in fig.layout.annotations
+                      if getattr(a, "xref", "").startswith("x")
+                      or "subplot" in str(getattr(a, "xref", ""))]
+        # Subplot titles always come first in `annotations` for
+        # make_subplots; the count matches n_rows*n_cols.
+        for ann, new_text in zip(fig.layout.annotations[:n_rows * n_cols],
+                                  new_titles):
+            ann.text = new_text
+
+    # Add a left-side label per row (Full window / Last 90D / ...).
+    # x=-0.04 in paper coords + right-anchor parks the label inside the
+    # left margin without going off-screen at narrower viewport widths.
+    annotations = list(fig.layout.annotations)
+    for r, (label, _) in enumerate(rne.CUM_PERIODS):
+        y_center = 1.0 - (r + 0.5) / n_rows
+        annotations.append(dict(
+            text=f"<b>{label}</b>",
+            xref="paper", yref="paper",
+            x=-0.04, y=y_center,
+            xanchor="right", yanchor="middle",
+            showarrow=False,
+            font=dict(size=11, color="#444"),
+        ))
+    fig.layout.annotations = annotations
+
+    # Drop redundant per-panel y/x titles; keep "cum ETH" on every
+    # leftmost panel (tiny so it doesn't clash with the row label).
+    for r in range(1, n_rows + 1):
+        for c in range(1, n_cols + 1):
+            fig.update_yaxes(title_text=("cum ETH" if c == 1 else ""),
+                             title_font=dict(size=10),
+                             row=r, col=c)
+            fig.update_xaxes(title_text=("day" if r == n_rows else ""),
+                             row=r, col=c)
+
     fig.update_layout(
-        title_text="", height=900,
-        margin=dict(l=70, r=30, t=70, b=50),
+        title_text="",
+        height=260 * n_rows + 120,
+        # ~150 px left margin: hosts row label + y-axis tick labels +
+        # "cum ETH" title without overflowing the figure box.
+        margin=dict(l=150, r=40, t=70, b=60),
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                     xanchor="center", x=0.5),
         hovermode="x",
@@ -1086,7 +1206,7 @@ def fig_distribution_boxplots(hourly: pl.DataFrame,
                                 daily: pl.DataFrame) -> go.Figure:
     """3 rows × 2 cols of boxplots:
         row 1: 51 vs 60 set 1 vs 60 set 2  (hourly | daily)
-        row 2: p_min sweep — 51 + 60 at 0.02/0.03/0.04/0.05  (hourly | daily)
+        row 2: p_min range — 51 + 60 at 0.02/0.03/0.04/0.05  (hourly | daily)
     """
     if "boxplots" in _REVENUE_FIG_CACHE:
         return _REVENUE_FIG_CACHE["boxplots"]
@@ -1099,8 +1219,8 @@ def fig_distribution_boxplots(hourly: pl.DataFrame,
         subplot_titles=(
             "Hourly ETH (set 1 vs set 2)",
             "Daily ETH (set 1 vs set 2)",
-            "Hourly ETH, p_min sweep",
-            "Daily ETH, p_min sweep",
+            "Hourly ETH, p_min range",
+            "Daily ETH, p_min range",
         ),
     )
     # ── Row 1: set 1 vs set 2 ──────────────────────────────────────
@@ -1123,7 +1243,7 @@ def fig_distribution_boxplots(hourly: pl.DataFrame,
     fig.update_yaxes(title_text="ETH/h",  row=1, col=1, type="log")
     fig.update_yaxes(title_text="ETH/day", row=1, col=2, type="log")
 
-    # ── Row 2: p_min sweep ─────────────────────────────────────────
+    # ── Row 2: p_min range ─────────────────────────────────────────
     fig.add_trace(go.Box(y=hourly["eth_51"].to_numpy(),
                           name="ArbOS 51", marker_color="#d62728",
                           boxpoints="outliers", showlegend=False),
@@ -1166,7 +1286,7 @@ def fig_distribution_boxplots(hourly: pl.DataFrame,
 
 def revenue_summary_tables_html(hourly: pl.DataFrame,
                                   daily: pl.DataFrame) -> str:
-    """Stats table (per window) + p_min sweep table — both produced by
+    """Stats table (per window) + p_min range table — both produced by
     revenue_no_elasticity.py.  Side by side under .revenue-tables."""
     import revenue_no_elasticity as rne                           # noqa: E402
     stats = rne.build_stats_table(hourly, daily)
@@ -1174,11 +1294,11 @@ def revenue_summary_tables_html(hourly: pl.DataFrame,
     return (
         '<div class="revenue-tables">'
         '  <div class="rev-table-block">'
-        '    <h3>Window summary (51 vs 60, ETH)</h3>'
+        '    <h3>Window summary, 51 vs 60 set 1 (ETH, p<sub>min</sub> = 0.02 gwei)</h3>'
         f'    {stats}'
         '  </div>'
         '  <div class="rev-table-block">'
-        '    <h3>Full-window totals, p<sub>min</sub> sweep</h3>'
+        '    <h3>Full-window totals, p<sub>min</sub> range</h3>'
         f'    {sweep}'
         '  </div>'
         '</div>'
@@ -1186,8 +1306,10 @@ def revenue_summary_tables_html(hourly: pl.DataFrame,
 
 
 def fig_cum_revenue_pmin_sweep(hourly: pl.DataFrame) -> go.Figure:
-    """Cumulative ETH revenue for the ArbOS 60 p_min sweep (0.02 / 0.03 /
-    0.04 / 0.05 gwei) vs ArbOS 51, two panels: Full window | Last 30D."""
+    """ArbOS 60 p_min range cumulative ETH, 2 rows × 3 cols.
+        Cols:  Last 30D (left)  |  Last 90D  |  Full window (right).
+        Row 1: cumulative ETH per p_min vs ArbOS 51.
+        Row 2: % gain vs ArbOS 51, all lines start at 0 % at slice start."""
     if "cum_pmin" in _REVENUE_FIG_CACHE:
         return _REVENUE_FIG_CACHE["cum_pmin"]
 
@@ -1207,27 +1329,48 @@ def fig_cum_revenue_pmin_sweep(hourly: pl.DataFrame) -> go.Figure:
         ))
 
     fig = make_subplots(
-        rows=1, cols=3,
-        subplot_titles=("Full window", "Last 90 days", "Last 30 days"),
-        horizontal_spacing=0.07,
+        rows=2, cols=3,
+        subplot_titles=(
+            "Last 30 days", "Last 90 days", "Full window",
+            "", "", "",
+        ),
+        horizontal_spacing=0.07, vertical_spacing=0.12,
+        row_heights=[0.55, 0.45],
     )
-    _cumulative_panel(fig, daily,    series=series,
+    # Row 1 — cumulative ETH per p_min (and ArbOS 51 baseline).
+    _cumulative_panel(fig, daily_30, series=series,
                       row=1, col=1, show_legend=True)
     _cumulative_panel(fig, daily_90, series=series,
                       row=1, col=2, show_legend=False)
-    _cumulative_panel(fig, daily_30, series=series,
+    _cumulative_panel(fig, daily,    series=series,
                       row=1, col=3, show_legend=False)
+    # Row 2 — performance (% gain over ArbOS 51).
+    _performance_panel(fig, daily_30, baseline_col="eth_51",
+                       series=series, row=2, col=1, show_legend=False)
+    _performance_panel(fig, daily_90, baseline_col="eth_51",
+                       series=series, row=2, col=2, show_legend=False)
+    _performance_panel(fig, daily,    baseline_col="eth_51",
+                       series=series, row=2, col=3, show_legend=False)
     for c in (1, 2, 3):
         fig.update_yaxes(
             title_text=("Cumulative ETH" if c == 1 else ""),
             showline=True, linewidth=1.0, linecolor="rgba(0,0,0,0.45)",
             mirror=True, ticks="outside", row=1, col=c,
         )
+        fig.update_yaxes(
+            title_text=("% gain vs ArbOS 51" if c == 1 else ""),
+            ticksuffix="%",
+            showline=True, linewidth=1.0, linecolor="rgba(0,0,0,0.45)",
+            mirror=True, ticks="outside", row=2, col=c,
+        )
         fig.update_xaxes(showline=True, linewidth=1.0,
                           linecolor="rgba(0,0,0,0.45)",
                           mirror=True, ticks="outside", row=1, col=c)
+        fig.update_xaxes(showline=True, linewidth=1.0,
+                          linecolor="rgba(0,0,0,0.45)",
+                          mirror=True, ticks="outside", row=2, col=c)
     fig.update_layout(
-        template="plotly_white", autosize=True, height=520,
+        template="plotly_white", autosize=True, height=720,
         margin=dict(l=70, r=30, t=70, b=50),
         font=dict(size=12, color="#222"),
         hovermode="x",
@@ -1246,7 +1389,7 @@ def revenue_no_elasticity_slide_html() -> str:
         1. Intro / what we are doing.
         2. Hourly + daily revenue time series + deltas.
         3. Cumulative ETH revenue overview.
-        4. ArbOS 60 p_min sweep, cumulative ETH.
+        4. ArbOS 60 p_min range, cumulative ETH.
         5. Cumulative grid (4 periods × 4 p_min).
         6. Spike-window zoom (Jan 29 to Feb 7).
         7. Distribution boxplots.
@@ -1289,14 +1432,14 @@ def revenue_no_elasticity_slide_html() -> str:
         '          most pronounced congestion in the dataset.</li>'
         '      <li><b>Cumulative ETH</b> per window: full / 90D / 30D, '
         '          ArbOS 51 vs 60 set 1 vs set 2.</li>'
-        '      <li><b>p<sub>min</sub> sweep</b>: 0.02, 0.03, 0.04, '
+        '      <li><b>p<sub>min</sub> range</b>: 0.02, 0.03, 0.04, '
         '          0.05 gwei across ArbOS 60.</li>'
         '      <li><b>Cumulative grid</b>: 4 windows × 4 '
         '          p<sub>min</sub> values.</li>'
         '      <li><b>Distribution boxplots</b>: hourly + daily ETH, '
-        '          set 1 vs set 2 + p<sub>min</sub> sweep.</li>'
+        '          set 1 vs set 2 + p<sub>min</sub> range.</li>'
         '      <li><b>Summary tables</b>: window-by-window totals + '
-        '          p<sub>min</sub> sweep totals.</li>'
+        '          p<sub>min</sub> range totals.</li>'
         '    </ul>'
         '  </div>'
         '</section>'
@@ -1305,26 +1448,19 @@ def revenue_no_elasticity_slide_html() -> str:
         '<section class="chart-stats-slide">'
         '  <h2>Cumulative ETH revenue, 51 vs 60</h2>'
         '  <div class="slide-note">'
-        '    <b>Data.</b> Cumulative ETH from day zero of each slice. '
-        '    51 (red), 60 set 1 (blue), 60 set 2 (cyan, dashed). Both '
-        '    at p<sub>min</sub> = 0.02 gwei.<br>'
-        '    <b>Result.</b> Set 1 and set 2 are within a few percent '
-        '    of each other; both gain meaningfully on 51 over the '
-        '    full window, less so over the last 90 days.'
+        '    Cumulative ETH from day zero of each slice. '
+        '    51 (red), 60 set 1 (blue), 60 set 2 (cyan, dashed). '
+        '    Both ArbOS 60 lines at p<sub>min</sub> = 0.02 gwei.'
         '  </div>'
         f' <div class="hist-grid">{fig_div(f_cum, "fig-cum-overview")}</div>'
         '</section>'
     )
     pmin_section = (
         '<section class="chart-stats-slide">'
-        '  <h2>ArbOS 60 p<sub>min</sub> sweep, cumulative ETH</h2>'
+        '  <h2>ArbOS 60 p<sub>min</sub> range, cumulative ETH</h2>'
         '  <div class="slide-note">'
-        '    <b>Data.</b> Same usage, ArbOS 60 set 1 priced at '
-        '    p<sub>min</sub> ∈ '
-        '    {0.02, 0.03, 0.04, 0.05} gwei, vs 51 baseline (red).<br>'
-        '    <b>Result.</b> Revenue scales linearly in p<sub>min</sub>: '
-        '    the price exponent depends on inflow / target only, so '
-        '    p<sub>min</sub> is a clean revenue knob.'
+        '    Same usage, ArbOS 60 set 1 priced at p<sub>min</sub> ∈ '
+        '    {0.02, 0.03, 0.04, 0.05} gwei, vs 51 baseline (red).'
         '  </div>'
         f' <div class="hist-grid">{fig_div(f_pmin, "fig-cum-pmin")}</div>'
         '</section>'
@@ -1333,12 +1469,8 @@ def revenue_no_elasticity_slide_html() -> str:
         '<section class="chart-stats-slide">'
         '  <h2>Cumulative ETH: 4 windows × 4 p<sub>min</sub></h2>'
         '  <div class="slide-note">'
-        '    <b>Data.</b> Each panel = one (window, p<sub>min</sub>) '
-        '    pair, 51 vs 60 set 1.<br>'
-        '    <b>Result.</b> The crossover point where 60 catches and '
-        '    overtakes 51 happens earlier as p<sub>min</sub> rises; '
-        '    on the 7-day window 60 only beats 51 from p<sub>min</sub> '
-        '    ≳ 0.04 gwei.'
+        '    Each panel: one (window, p<sub>min</sub>) pair, 51 vs '
+        '    60 set 1.'
         '  </div>'
         f' <div class="hist-grid">{fig_div(f_grid, "fig-cum-grid")}</div>'
         '</section>'
@@ -1360,12 +1492,8 @@ def revenue_no_elasticity_slide_html() -> str:
         '<section class="chart-stats-slide">'
         '  <h2>Distribution shape: hourly and daily ETH</h2>'
         '  <div class="slide-note">'
-        '    <b>Data.</b> Top row, set 1 vs set 2 (vs 51). Bottom row, '
-        '    51 vs 60 across the p<sub>min</sub> sweep. Log-y on all '
-        '    boxes.<br>'
-        '    <b>Result.</b> The median shifts up under 60 in every '
-        '    panel; the upper-tail outliers are where the cumulative '
-        '    advantage accrues.'
+        '    Top row, set 1 vs set 2 (vs 51). Bottom row, 51 vs 60 '
+        '    across the p<sub>min</sub> range. Log-y on all boxes.'
         '  </div>'
         f' <div class="hist-grid">{fig_div(f_box, "fig-rev-box")}</div>'
         '</section>'
@@ -1374,12 +1502,8 @@ def revenue_no_elasticity_slide_html() -> str:
         '<section class="chart-stats-slide">'
         '  <h2>Summary tables</h2>'
         '  <div class="slide-note">'
-        '    <b>Data.</b> Window-by-window ETH totals + per-resource '
-        '    p<sub>min</sub> sweep totals over the full window.<br>'
-        '    <b>Result.</b> ArbOS 60 set 1 picks up roughly +50% over '
-        '    the full window at the on-chain p<sub>min</sub> = 0.02 '
-        '    gwei; the gain compounds super-linearly as p<sub>min</sub> '
-        '    rises (revenue is linear, baseline is fixed).'
+        '    Window-by-window ETH totals + p<sub>min</sub> range '
+        '    totals over the full window.'
         '  </div>'
         f' {tables_html}'
         '</section>'
@@ -2736,6 +2860,81 @@ def clustering_slide_html() -> str:
     )
 
 
+def demand_elasticity_slide_html() -> str:
+    """Slide 10: short methodology preview for the demand-elasticity sim
+    that uses the K=5 workload archetypes from the clustering pass."""
+    def eq(latex: str) -> str:
+        return f'<div class="method-eq">\\[{latex}\\]</div>'
+
+    archetype_eq = (
+        r"M[k, c] = \frac{\sum_{tx \in c} g_{tx,k}}{|c|}"
+    )
+    nnls_eq = (
+        r"n(t) = \arg\min_{n \,\ge\, 0}\;"
+        r"\bigl\| \, M \, n - g(t) \, \bigr\|_{2}^{2}"
+    )
+    elasticity_eq = (
+        r"g'_{c}(t) = D_c \cdot \bar p'_{c}(t)^{-\alpha}"
+        r", \quad \alpha = 1"
+    )
+
+    return (
+        '<section class="chart-stats-slide capacity-intro elasticity-intro">'
+        '  <h2>Demand elasticity: cluster-based counterfactual</h2>'
+        '  <div class="capacity-definition">'
+        '    <div class="who">Idea</div>'
+        '    Use the K = 5 KMeans clusters as workload types '
+        '    (compute-heavy, storage-write-heavy, ...). At every '
+        '    hour, decompose the realised per-resource gas into a '
+        '    non-negative number of txs per cluster; under '
+        '    ArbOS 60 prices, each cluster reacts with constant-'
+        '    elasticity demand and re-spends its budget across its '
+        '    own resource mix. The result is a counterfactual '
+        '    gas usage that <i>does</i> respond to price changes.'
+        '  </div>'
+        '  <div class="methodology">'
+        '    <ol>'
+        '      <li><b>Cluster centroid matrix</b> M (resources × '
+        '          K clusters) from the cluster aggregator: each '
+        '          column is a cluster’s average per-tx gas vector.'
+        f'         {eq(archetype_eq)}'
+        '      </li>'
+        '      <li><b>Decompose</b> each hour’s realised resource '
+        '          gas vector g(t) into a non-negative tx count '
+        '          per cluster:'
+        f'         {eq(nnls_eq)}'
+        '      </li>'
+        '      <li><b>Calibrate elasticity</b>: the per-cluster '
+        '          budget D<sub>c</sub> is the historical product '
+        '          of cluster gas and effective price.</li>'
+        '      <li><b>Predict counterfactual</b> per-cluster gas '
+        '          under ArbOS 60 prices, at unit elasticity '
+        '          (α = 1):'
+        f'         {eq(elasticity_eq)}'
+        '      </li>'
+        '      <li><b>Project back</b> to per-resource gas via M, '
+        '          giving the predicted post-ArbOS-60 workload.</li>'
+        '    </ol>'
+        '  </div>'
+        '</section>'
+    )
+
+
+def thank_you_slide_html() -> str:
+    """Slide 11: closer."""
+    return (
+        '<section class="ty-slide">'
+        '  <h1>Thank you</h1>'
+        '  <h2>Questions?</h2>'
+        '  <div class="logo-row">'
+        '    <img src="assets/arbitrum.png"         alt="Arbitrum">'
+        '    <img src="assets/offchain_labs.png"    alt="Offchain Labs">'
+        '    <img src="assets/entropy_advisors.png" alt="Entropy Advisors">'
+        '  </div>'
+        '</section>'
+    )
+
+
 def _lighten_hex(hex_color: str, factor: float = 0.55) -> str:
     """Mix `hex_color` with white.  factor=0 → original, 1 → white."""
     h = hex_color.lstrip("#")
@@ -3902,6 +4101,26 @@ PAGE_TEMPLATE = """<!doctype html>
       margin: 0.2em 0 !important;
     }}
 
+    /* Thank-you closer slide — mirrors cover styling. */
+    .reveal .slides section.ty-slide {{
+      text-align: center;
+    }}
+    .reveal .slides section.ty-slide h1 {{
+      font-size: 2.6em; margin: 0.2em 0 0.1em; color: #08519c;
+      letter-spacing: 0.02em;
+    }}
+    .reveal .slides section.ty-slide h2 {{
+      font-size: 1.2em; color: #555; font-weight: 400;
+      margin: 0.2em 0 1.2em;
+    }}
+    .reveal .slides section.ty-slide .logo-row {{
+      display: flex; justify-content: center; align-items: center;
+      gap: 3.5em; margin-top: 1.5em;
+    }}
+    .reveal .slides section.ty-slide .logo-row img {{
+      max-height: 80px; max-width: 240px; object-fit: contain;
+    }}
+
     /* Capacity-headroom methodology slide. */
     .capacity-intro .capacity-definition {{
       background: rgba(31, 119, 180, 0.06);
@@ -3937,6 +4156,22 @@ PAGE_TEMPLATE = """<!doctype html>
       font-size: 1.6em !important;
       margin: 0.3em 0 !important;
     }}
+    /* Demand-elasticity slide has 3 display equations + 5 bullets, so
+       the per-eq size is dropped a notch to keep the slide on one
+       screen. */
+    .elasticity-intro .methodology {{
+      font-size: 0.55em;
+    }}
+    .elasticity-intro .methodology li {{ margin: 0.3em 0; }}
+    .elasticity-intro .methodology .method-eq mjx-container[display="true"] {{
+      font-size: 1.15em !important;
+      margin: 0.15em 0 !important;
+    }}
+    .elasticity-intro .capacity-definition {{
+      font-size: 0.55em;
+      padding: 0.55em 1em;
+      margin: 0.3em auto 0.5em;
+    }}
 
     /* Short data + interpretation note above/below figures. */
     .slide-note {{
@@ -3949,21 +4184,33 @@ PAGE_TEMPLATE = """<!doctype html>
     }}
     .slide-note b {{ color: #08519c; font-weight: 600; }}
 
-    /* Side-by-side summary tables on the revenue summary slide. */
+    /* Stacked summary tables on the revenue summary slide. */
     .revenue-tables {{
-      display: flex; flex-wrap: wrap; gap: 1.5em;
-      justify-content: center; margin: 0.5em auto 0;
+      display: flex; flex-direction: column; gap: 1.2em;
+      align-items: center; margin: 0.5em auto 0;
       max-width: 1300px;
     }}
     .revenue-tables .rev-table-block {{
-      flex: 1 1 540px; min-width: 480px;
+      width: 100%; max-width: 1200px;
     }}
     .revenue-tables .rev-table-block h3 {{
       font-size: 0.6em; color: #444; font-weight: 600;
-      margin: 0 0 0.4em 0;
+      margin: 0 0 0.4em 0; text-align: center;
     }}
     .revenue-tables table {{
-      font-size: 0.6em !important;
+      font-size: 0.62em !important;
+      margin: 0 auto !important;
+    }}
+    /* Reveal.js applies row-striping to .reveal table tr:nth-child(even),
+       which clobbers per-cell heatmap backgrounds.  Strip it on these
+       tables so the inline `background: ... !important` heat colours
+       show up. */
+    .reveal .slides .revenue-tables table tr {{
+      background: transparent !important;
+    }}
+    .reveal .slides .revenue-tables table th,
+    .reveal .slides .revenue-tables table td {{
+      background-clip: padding-box;
     }}
 
     /* Revenue-comparison intro slide: two side-by-side cards. */
@@ -4326,6 +4573,12 @@ PAGE_TEMPLATE = """<!doctype html>
     <!-- Slide 9: per-tx clustering (CLR + KMeans) -->
     {SLIDE9}
 
+    <!-- Slide 10: demand elasticity (archetype-based) -->
+    {SLIDE10}
+
+    <!-- Slide 11: thank you / closer -->
+    {SLIDE11}
+
   </div>
 </div>
 
@@ -4438,6 +4691,8 @@ def main() -> None:
         SLIDE7=revenue_no_elasticity_slide_html(),
         SLIDE8=capacity_slide_html(),
         SLIDE9=clustering_slide_html(),
+        SLIDE10=demand_elasticity_slide_html(),
+        SLIDE11=thank_you_slide_html(),
     )
     OUT_HTML.write_text(page)
     print(f"Saved {OUT_HTML} ({OUT_HTML.stat().st_size / 1024:.1f} KB)")
