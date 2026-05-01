@@ -491,6 +491,8 @@ def arbos60_code_slide_html() -> str:
     # Constants & per-set tables sourced from arbos60.py (Set 1 & Set 2
     # configurations from the proposal — kept verbatim so it stays in sync
     # with the simulator if the constants change there).
+    # Mirrors arbos60.py SET_WEIGHTS_1/SET_LADDERS_1 (Set 1) and
+    # SET_WEIGHTS_2/SET_LADDERS_2 (Set 2 — short 2-rung ladder).
     sets_data = [
         (
             "Set 1 (default)",
@@ -514,7 +516,7 @@ def arbos60_code_slide_html() -> str:
             ],
         ),
         (
-            "Set 2 (alt)",
+            "Set 2 (alternative)",
             [
                 ("Storage/Compute mix 1",
                  {"c": 1.0, "sw": 0.6714, "sr": 0.141, "sg": 0.0604},
@@ -610,6 +612,18 @@ def arbos60_code_slide_html() -> str:
         r"\sum_{k} a_{i,k} \, g_{k}(t) \le T_{i,j}"
         r"\quad \text{(sustained over a window of } A_{i,j} \text{ seconds)}"
     )
+    notation_block = (
+        '<div class="notation-block">'
+        '  <span class="notation-label">Notation</span>'
+        '  <span><span class="sym">g<sub>c</sub></span> Computation</span>'
+        '  <span><span class="sym">g<sub>sw</sub></span> Storage Write</span>'
+        '  <span><span class="sym">g<sub>sr</sub></span> Storage Read</span>'
+        '  <span><span class="sym">g<sub>sg</sub></span> Storage Growth</span>'
+        '  <span><span class="sym">g<sub>hg</sub></span> History Growth</span>'
+        '  <span><span class="sym">g<sub>l2</sub></span> L2 Calldata</span>'
+        '  <span class="notation-note">all in gas / second</span>'
+        '</div>'
+    )
     spec_block = (
         '<div class="spec-block">'
         '  <div class="const-pmin">'
@@ -619,9 +633,10 @@ def arbos60_code_slide_html() -> str:
         '    <b>0.01 gwei</b>'
         '    <span class="const-note">pre-DIA</span>'
         '  </div>'
+        f'  {notation_block}'
         '  <div class="spec-ineq">'
         '    <div class="spec-label">'
-        '      Constraint inequality (for each set i, constraint j):'
+        '      Constraint inequality, for each set <i>i</i> and constraint <i>j</i>:'
         '    </div>'
         f'   \\[{inequality_eq}\\]'
         '  </div>'
@@ -1630,6 +1645,30 @@ PAGE_TEMPLATE = """<!doctype html>
     .const-note {{ color: #777; font-weight: 400;
                    margin-left: 0.25em; }}
     .const-sep  {{ color: #aaa; margin: 0 0.45em; }}
+
+    /* Resource-symbol notation block on slide 7a. */
+    .notation-block {{
+      display: flex; flex-wrap: wrap;
+      gap: 0.4em 1.4em;
+      font-size: 0.6em; color: #444;
+      background: #f6f7f9; border: 1px solid #e1e4e8;
+      border-radius: 3px;
+      padding: 0.45em 0.85em;
+      margin: 0.4em 0 0.6em;
+    }}
+    .notation-block .notation-label {{
+      font-weight: 600; color: #333;
+      text-transform: uppercase; letter-spacing: 0.05em;
+      font-size: 0.85em;
+    }}
+    .notation-block .sym {{
+      font-family: ui-monospace, Menlo, Monaco, monospace;
+      color: #1f3a5f; font-weight: 600;
+      margin-right: 0.3em;
+    }}
+    .notation-block .notation-note {{
+      color: #888; font-style: italic;
+    }}
 
     /* Slide 6b footer: GitHub icon + short text link. */
     .source-link {{
