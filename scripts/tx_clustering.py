@@ -71,9 +71,9 @@ CHUNKSIZE      = 1_000_000
 PASS2_CHUNK    = 500_000
 MBK_BATCH      = 8_192
 RNG_SEED       = 42
-MIN_PRICED_GAS = 30_000
+MIN_PRICED_GAS = 30_000               # gas-floor filter restored (skips trivially small txs)
 CLR_EPS        = 1.0                 # gas-unit floor for zero-replacement in CLR
-CLR_TAIL_PCT   = 0.1                 # drop rows outside per-dim [p, 100-p] CLR bounds
+CLR_TAIL_PCT   = 0.0                 # 0.0 disables per-dim outlier trimming (keeps every row)
 N_LOGGAS_BINS  = 40
 N_SHARE_BINS   = 50                   # for median-share histogram (0..1, step 0.02)
 SHARE_EDGES    = np.linspace(0.0, 1.0, N_SHARE_BINS + 1)
@@ -240,11 +240,20 @@ def stream_fit(
         n_priced += G.shape[0]
 
         if clr_lo is None:
-            clr_lo = np.percentile(X_clr, CLR_TAIL_PCT,         axis=0)
-            clr_hi = np.percentile(X_clr, 100.0 - CLR_TAIL_PCT, axis=0)
-            print(f"  CLR bounds (per-dim, {CLR_TAIL_PCT}%/{100-CLR_TAIL_PCT}%):")
-            for k, r in enumerate(RESOURCES):
-                print(f"    {r:>3s}: [{clr_lo[k]:+.3f}, {clr_hi[k]:+.3f}]")
+            if CLR_TAIL_PCT > 0.0:
+                clr_lo = np.percentile(X_clr, CLR_TAIL_PCT,         axis=0)
+                clr_hi = np.percentile(X_clr, 100.0 - CLR_TAIL_PCT, axis=0)
+                print(f"  CLR bounds (per-dim, {CLR_TAIL_PCT}%/{100-CLR_TAIL_PCT}%):")
+                for k, r in enumerate(RESOURCES):
+                    print(f"    {r:>3s}: [{clr_lo[k]:+.3f}, {clr_hi[k]:+.3f}]")
+            else:
+                # Outlier trimming disabled: bounds wide-open so the
+                # downstream filter is a no-op and every priced tx
+                # ends up in the fit.
+                clr_lo = np.full(X_clr.shape[1], -np.inf)
+                clr_hi = np.full(X_clr.shape[1],  np.inf)
+                print("  CLR outlier trimming disabled "
+                       "(CLR_TAIL_PCT = 0.0)")
 
         trimmed = _apply_clr_bounds(
             block_arr, sender_arrow, G, X_clr, Lg, clr_lo, clr_hi,

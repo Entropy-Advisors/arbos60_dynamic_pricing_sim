@@ -49,18 +49,23 @@ import arbos60 as a60_mod                                        # noqa: E402
 
 _ROOT     = _HERE.parent
 OUT_HTML  = _ROOT / "figures" / "capacity_estimator.html"
-PRICES_CACHE = _ROOT / "data" / "capacity_hourly_prices.parquet"
+PRICES_CACHE     = _ROOT / "data" / "capacity_hourly_prices.parquet"
+CAP_HR_CACHE     = _ROOT / "data" / "capacity_hourly_summary.parquet"
+CAP_HR_MIX_CACHE = _ROOT / "data" / "capacity_hourly_summary_mix.parquet"
 
 # ── Capacity constants ──────────────────────────────────────────────────────
 T51_PRE_DIA   = 7.0       # Mgas/s, single rung pre-DIA
 T51_POST_DIA  = 10.0      # Mgas/s, smallest rung of the Dia ladder
 DIA_LAUNCH_TS = datetime(2026, 1, 8, 17, 0, 0)
 
-# Both Set 1 and Set 2 share the same first-rung T per set i, so
-# steady-state capacity is identical between configs (they differ only
-# in higher rungs and a tiny weight perturbation).  We use Set 1.
+# Both Set 1 and Set 2 of ArbOS 60 are tracked: they share T_{i,0} but
+# differ in weights, so the workload-mix-dependent capacity diverges in
+# practice.  Set 1 keeps its position in the rest of the script for
+# backwards compat; Set 2 is computed alongside.
 SET_WEIGHTS = a60_mod.Arbos60GasPricing.SET_WEIGHTS_1
 SET_LADDERS = a60_mod.Arbos60GasPricing.SET_LADDERS_1
+SET_WEIGHTS_2 = a60_mod.Arbos60GasPricing.SET_WEIGHTS_2
+SET_LADDERS_2 = a60_mod.Arbos60GasPricing.SET_LADDERS_2
 
 RESOURCES = ["c", "sw", "sr", "sg", "hg", "l2"]
 RESOURCE_LABEL = {
@@ -132,14 +137,25 @@ def aggregate_per_second(df: pl.DataFrame):
 
 
 # ── Capacity per second (Mgas/s) ───────────────────────────────────────────
-def capacity_60_per_second(G: np.ndarray, g: np.ndarray) -> np.ndarray:
+def capacity_60_per_second(
+    G: np.ndarray, g: np.ndarray,
+    set_weights: dict | None = None,
+    set_ladders: dict | None = None,
+) -> np.ndarray:
     """capacity_60(t) = min_i T_{i,0} / Σ_k a_{i,k}·α_k(t)
                      = min_i T_{i,0} · G(t) / Σ_k a_{i,k}·g_k(t)
     Both are unitless ratios times T_{i,0} (Mgas/s) ⇒ result in Mgas/s.
-    Empty seconds return +inf so they can't pull down the per-set min."""
+    Empty seconds return +inf so they can't pull down the per-set min.
+
+    `set_weights` / `set_ladders` default to Set 1; pass `SET_WEIGHTS_2`
+    / `SET_LADDERS_2` for Set 2."""
+    if set_weights is None:
+        set_weights = SET_WEIGHTS
+    if set_ladders is None:
+        set_ladders = SET_LADDERS
     cap_min = np.full_like(G, np.inf, dtype=np.float64)
-    for set_name, a_i in SET_WEIGHTS.items():
-        T_i0 = SET_LADDERS[set_name][0][0]      # Mgas/s
+    for set_name, a_i in set_weights.items():
+        T_i0 = set_ladders[set_name][0][0]      # Mgas/s
         denom = np.zeros_like(G)
         for k_idx, k in enumerate(RESOURCES):
             a_ik = float(a_i.get(k, 0.0))
@@ -307,9 +323,14 @@ def aggregate_capacity_hourly_mix(
 # ── Hourly aggregation of capacity / headroom / saturation ─────────────────
 def aggregate_capacity_hourly(
     sec_epoch: np.ndarray, G: np.ndarray,
-    cap_51: np.ndarray, cap_60: np.ndarray,
+    cap_51: np.ndarray,
+    cap_60_v1: np.ndarray, cap_60_v2: np.ndarray,
     threshold: float,
 ) -> pl.DataFrame:
+    """Hourly summary of per-second capacity / headroom / saturation +
+    gain Δ% vs ArbOS 51, computed for ArbOS 60 Set 1 and Set 2 in one pass.
+    Set 1 columns keep their unsuffixed names for back-compat; Set 2 uses
+    the `_v2` suffix."""
     hour_idx = (sec_epoch // 3600).astype(np.int64)
     hour_min = int(hour_idx.min())
     hour_b   = hour_idx - hour_min
@@ -320,56 +341,63 @@ def aggregate_capacity_hourly(
     used_n = np.bincount(hour_b[used], minlength=n_hr).astype(np.float64)
     safe   = np.where(used_n > 0, used_n, 1.0)
 
-    finite_60 = used & np.isfinite(cap_60)
-    used60_n  = np.bincount(hour_b[finite_60], minlength=n_hr).astype(np.float64)
-    safe60    = np.where(used60_n > 0, used60_n, 1.0)
-
-    # Per-second headroom %: (cap − G) / cap × 100.  Clipped to [0, 100].
-    headroom_60 = np.zeros_like(G)
-    headroom_60[finite_60] = np.clip(
-        100.0 * (cap_60[finite_60] - G_mgas[finite_60]) / cap_60[finite_60],
-        0.0, 100.0,
-    )
     headroom_51 = np.clip(100.0 * (cap_51 - G_mgas) / cap_51, 0.0, 100.0)
-
-    sat_60 = used & np.isfinite(cap_60) & (G_mgas >= threshold * cap_60)
     sat_51 = used & (G_mgas >= threshold * cap_51)
 
-    # Per-second capacity gain (%): (cap_60 − cap_51) / cap_51 × 100
-    gain = np.zeros_like(G)
-    gain[finite_60] = 100.0 * (cap_60[finite_60] - cap_51[finite_60]) \
-                            / cap_51[finite_60]
-    # Mean per hour from a streaming sum.
-    gain_mean = np.bincount(hour_b[finite_60], weights=gain[finite_60],
-                            minlength=n_hr) / safe60
-    # Median per hour via polars groupby (no streaming median in numpy
-    # without sorting per group).
-    gain_df = pl.DataFrame({
-        "hour": hour_b[finite_60].astype(np.int32),
-        "gain": gain[finite_60],
-    }).group_by("hour").agg(pl.col("gain").median().alias("gm")).sort("hour")
-    gain_median = np.zeros(n_hr)
-    gain_median[gain_df["hour"].to_numpy()] = gain_df["gm"].to_numpy()
-
-    return pl.DataFrame({
+    out: dict = {
         "hour":     ((np.arange(n_hr, dtype=np.int64) + hour_min) * 3600 * 1000
                      ).astype("datetime64[ms]"),
         "mean_G":   np.bincount(hour_b[used], weights=G_mgas[used],
                                 minlength=n_hr) / safe,
         "cap_51":   np.bincount(hour_b[used], weights=cap_51[used],
                                 minlength=n_hr) / safe,
-        "cap_60":   np.bincount(hour_b[finite_60], weights=cap_60[finite_60],
-                                minlength=n_hr) / safe60,
         "headroom_51": np.bincount(hour_b[used], weights=headroom_51[used],
                                    minlength=n_hr) / safe,
-        "headroom_60": np.bincount(hour_b[finite_60],
-                                   weights=headroom_60[finite_60],
-                                   minlength=n_hr) / safe60,
         "sat_rate_51": np.bincount(hour_b[sat_51], minlength=n_hr) / 3600.0,
-        "sat_rate_60": np.bincount(hour_b[sat_60], minlength=n_hr) / 3600.0,
-        "gain_mean":   gain_mean,
-        "gain_median": gain_median,
-    })
+    }
+
+    def _add_set(cap_60: np.ndarray, suffix: str) -> None:
+        finite_60 = used & np.isfinite(cap_60)
+        used60_n  = np.bincount(hour_b[finite_60],
+                                 minlength=n_hr).astype(np.float64)
+        safe60    = np.where(used60_n > 0, used60_n, 1.0)
+
+        headroom_60 = np.zeros_like(G)
+        headroom_60[finite_60] = np.clip(
+            100.0 * (cap_60[finite_60] - G_mgas[finite_60]) / cap_60[finite_60],
+            0.0, 100.0,
+        )
+        sat_60 = used & np.isfinite(cap_60) & (G_mgas >= threshold * cap_60)
+
+        gain = np.zeros_like(G)
+        gain[finite_60] = 100.0 * (cap_60[finite_60] - cap_51[finite_60]) \
+                                / cap_51[finite_60]
+        gain_mean = np.bincount(hour_b[finite_60], weights=gain[finite_60],
+                                minlength=n_hr) / safe60
+        gain_df = pl.DataFrame({
+            "hour": hour_b[finite_60].astype(np.int32),
+            "gain": gain[finite_60],
+        }).group_by("hour").agg(pl.col("gain").median().alias("gm")).sort("hour")
+        gain_median = np.zeros(n_hr)
+        gain_median[gain_df["hour"].to_numpy()] = gain_df["gm"].to_numpy()
+
+        out[f"cap_60{suffix}"] = (
+            np.bincount(hour_b[finite_60], weights=cap_60[finite_60],
+                        minlength=n_hr) / safe60
+        )
+        out[f"headroom_60{suffix}"] = (
+            np.bincount(hour_b[finite_60], weights=headroom_60[finite_60],
+                        minlength=n_hr) / safe60
+        )
+        out[f"sat_rate_60{suffix}"] = (
+            np.bincount(hour_b[sat_60], minlength=n_hr) / 3600.0
+        )
+        out[f"gain_mean{suffix}"]   = gain_mean
+        out[f"gain_median{suffix}"] = gain_median
+
+    _add_set(cap_60_v1, "")        # set 1: no suffix (back-compat)
+    _add_set(cap_60_v2, "_v2")     # set 2: _v2 suffix
+    return pl.DataFrame(out)
 
 
 # ── Plotly figure + Ben's framing ──────────────────────────────────────────
@@ -686,31 +714,60 @@ PAGE_TEMPLATE = r"""<!doctype html>
 """
 
 
-# ── Driver ─────────────────────────────────────────────────────────────────
-def main() -> None:
+def compute_or_load_capacity_summaries(
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Load all three hourly DataFrames (`prices_hr`, `cap_hr`,
+    `cap_hr_mix`) — used by both `main()` and the slide builder.  If all
+    three caches exist, skip the expensive per-second pipeline entirely
+    (~tens of ms vs. minutes).  Otherwise run once and persist."""
+    if (PRICES_CACHE.exists() and CAP_HR_CACHE.exists()
+            and CAP_HR_MIX_CACHE.exists()):
+        print(f"  loading capacity caches:")
+        print(f"    {PRICES_CACHE}")
+        print(f"    {CAP_HR_CACHE}")
+        print(f"    {CAP_HR_MIX_CACHE}")
+        return (
+            pl.read_parquet(PRICES_CACHE),
+            pl.read_parquet(CAP_HR_CACHE),
+            pl.read_parquet(CAP_HR_MIX_CACHE),
+        )
+
     df = load_per_block_with_time()
 
     print("Aggregating gas per second...")
     sec_epoch, G_total, g = aggregate_per_second(df)
     print(f"  {len(sec_epoch):,} seconds")
 
-    print("Computing capacity_60 per second...")
-    cap_60 = capacity_60_per_second(G_total, g)
-    cap_51 = capacity_51_per_second(sec_epoch)
-    used = G_total > 0
-    print(f"  median capacity_60 (active seconds) = "
-          f"{np.median(cap_60[used & np.isfinite(cap_60)]):.2f} Mgas/s")
+    print("Computing capacity_60 per second (Set 1 + Set 2)...")
+    cap_60_v1 = capacity_60_per_second(G_total, g, SET_WEIGHTS,   SET_LADDERS)
+    cap_60_v2 = capacity_60_per_second(G_total, g, SET_WEIGHTS_2, SET_LADDERS_2)
+    cap_51    = capacity_51_per_second(sec_epoch)
 
     print("Computing or loading hourly arbos60 prices...")
     prices_hr = compute_or_load_hourly_prices(df)
 
-    print("Aggregating capacity to hourly (per-second mix)...")
-    cap_hr = aggregate_capacity_hourly(sec_epoch, G_total, cap_51, cap_60,
-                                        THRESHOLD)
+    print("Aggregating capacity to hourly (per-second mix, Set 1 + Set 2)...")
+    cap_hr = aggregate_capacity_hourly(
+        sec_epoch, G_total, cap_51,
+        cap_60_v1=cap_60_v1, cap_60_v2=cap_60_v2,
+        threshold=THRESHOLD,
+    )
 
     print("Aggregating capacity to hourly (hourly-averaged mix, Ben's recipe)...")
     cap_hr_mix = aggregate_capacity_hourly_mix(sec_epoch, G_total, g,
                                                 cap_51, THRESHOLD)
+
+    CAP_HR_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    cap_hr.write_parquet(CAP_HR_CACHE)
+    cap_hr_mix.write_parquet(CAP_HR_MIX_CACHE)
+    print(f"  cached → {CAP_HR_CACHE}")
+    print(f"  cached → {CAP_HR_MIX_CACHE}")
+    return prices_hr, cap_hr, cap_hr_mix
+
+
+# ── Driver ─────────────────────────────────────────────────────────────────
+def main() -> None:
+    prices_hr, cap_hr, cap_hr_mix = compute_or_load_capacity_summaries()
     finite_gain = np.isfinite(cap_hr_mix["gain_60"].to_numpy()) \
                   & (cap_hr_mix["mean_G"].to_numpy() > 0)
     if finite_gain.any():

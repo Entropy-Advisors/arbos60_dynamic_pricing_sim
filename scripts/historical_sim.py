@@ -44,6 +44,7 @@ RESOURCE_COLORS = {
     "StorageGrowth":   "#d62728",   # red
     "HistoryGrowth":   "#ff7f0e",   # orange
     "L2Calldata":      "#9467bd",   # purple
+    "L1Calldata":      "#e377c2",   # pink
 }
 
 
@@ -148,6 +149,7 @@ PRICED_KINDS = [
     "StorageGrowth",
     "HistoryGrowth",
     "L2Calldata",
+    "L1Calldata",
 ]
 GAS_RESOURCE_COLORS = {
     "c":  "#1f77b4",   # Computation — blue
@@ -252,7 +254,9 @@ def compute_backlogs(
 
 
 def hourly_gas_per_kind(blocks: pl.DataFrame) -> pl.DataFrame:
-    """Hourly raw gas per priced ResourceKind, keyed by `hour` (gas units)."""
+    """Hourly raw gas per priced ResourceKind, keyed by `hour` (gas units).
+    L1 calldata is included for visualisation (slide 4) even though
+    ArbOS 60 doesn't price it dynamically."""
     df = blocks.with_columns([
         (pl.col("computation") + pl.col("wasmComputation")).alias("gas_Computation"),
         pl.col("storageAccessWrite").alias("gas_StorageWrite"),
@@ -260,6 +264,7 @@ def hourly_gas_per_kind(blocks: pl.DataFrame) -> pl.DataFrame:
         pl.col("storageGrowth").alias("gas_StorageGrowth"),
         pl.col("historyGrowth").alias("gas_HistoryGrowth"),
         pl.col("l2Calldata").alias("gas_L2Calldata"),
+        pl.col("l1Calldata").alias("gas_L1Calldata"),
     ])
     return (
         df.group_by("hour")
@@ -1028,7 +1033,7 @@ def build_fig(blocks: pl.DataFrame, blocks_wide: pl.DataFrame | None = None) -> 
                 "ArbOS 60 + per-resource backlog panels: bounded to the "
                 "multigas extract coverage. ArbOS 51 honors the Dia "
                 "activation (2026-01-08 17:00 UTC) — pre-Dia: T = 7 Mgas/s, "
-                "A = 102 s, p<sub>min</sub> = 0.01 gwei; Dia: 6-rung ladder, "
+                "A = 102 s, p<sub>min</sub> = 0.01 gwei; Dia: 6-constraint ladder, "
                 "p<sub>min</sub> = 0.02 gwei.</sub>"
             ),
             x=0.0, xanchor="left",

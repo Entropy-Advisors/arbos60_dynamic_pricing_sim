@@ -128,6 +128,10 @@ WITH
       pw.address                                AS address,
       pw.tx_count                               AS tx_count,
       pw.revert_count                           AS revert_count,
+      (pw.tx_count > b.p001)                    AS is_high_vol,
+      (pw.tx_count >= toUInt64({revert_min_txs:UInt64})
+        AND pw.revert_count / toFloat64(pw.tx_count)
+            >= toFloat64({revert_ratio:Float64})) AS is_high_rev,
       (pw.tx_count > b.p001
        OR (pw.tx_count >= toUInt64({revert_min_txs:UInt64})
            AND pw.revert_count / toFloat64(pw.tx_count)
@@ -141,6 +145,10 @@ SELECT
   SUM(tx_count - revert_count)                   AS success_txs,
   SUM(revert_count)                              AS revert_txs,
   SUM(if(is_spam_day, tx_count, 0))              AS spammer_txs,
+  -- Per-signal split: high_vol_only / high_rev_only / both.  Sum to spammer_txs.
+  SUM(if(is_high_vol AND NOT is_high_rev, tx_count, 0))    AS spammer_txs_vol_only,
+  SUM(if(is_high_rev AND NOT is_high_vol, tx_count, 0))    AS spammer_txs_rev_only,
+  SUM(if(is_high_vol AND is_high_rev,     tx_count, 0))    AS spammer_txs_both,
   SUM(if(NOT is_spam_day, tx_count, 0))          AS nonspammer_txs,
   SUM(if(is_spam_day, revert_count, 0))          AS spammer_reverts,
   SUM(if(NOT is_spam_day, revert_count, 0))      AS nonspammer_reverts,

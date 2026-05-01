@@ -19,7 +19,7 @@ from __future__ import annotations
 import pathlib
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import polars as pl
@@ -342,14 +342,6 @@ def l2_fee_stats_html(daily: pl.DataFrame) -> str:
         f'      <div class="period-days">{n_post} days</div>'
         f'      <div class="period-range">{post_range}</div>'
         f'    </div>'
-        f'    <div class="delta-block">'
-        f'      <div class="delta-row"><span class="kv-key">'
-        f'        &Delta; daily mean</span>'
-        f'      <span class="kv-val">{d_mean}</span></div>'
-        f'      <div class="delta-row"><span class="kv-key">'
-        f'        &Delta; daily median</span>'
-        f'      <span class="kv-val">{d_median}</span></div>'
-        f'    </div>'
         f'  </div>'
         # Card 2 — daily L2 fees, pre vs post vs all-time
         f'  <div class="fee-card">'
@@ -558,7 +550,7 @@ def arbos60_code_slide_html() -> str:
     # configurations from the proposal — kept verbatim so it stays in sync
     # with the simulator if the constants change there).
     # Mirrors arbos60.py SET_WEIGHTS_1/SET_LADDERS_1 (Set 1) and
-    # SET_WEIGHTS_2/SET_LADDERS_2 (Set 2 — short 2-rung ladder).
+    # SET_WEIGHTS_2/SET_LADDERS_2 (Set 2 — short 2-constraint ladder).
     sets_data = [
         (
             "Set 1 (default)",
@@ -790,6 +782,1956 @@ def arbos60_code_slide_html() -> str:
         f'    {source_link}\n'
         '  </section>\n'
         f'  {arbos51_taylor_section}\n'
+        '</section>'
+    )
+
+
+# ── ArbOS 60 vs 51 revenue (no demand elasticity) ───────────────────────────
+# Cache rendered Plotly divs so repeated build.py runs (which re-import the
+# heavy historical_sim helpers anyway) skip the figure-building cost too.
+_REVENUE_FIG_CACHE: dict[str, go.Figure] = {}
+
+
+def _load_revenue_hourly() -> pl.DataFrame:
+    """Load the cached ArbOS 51 / 60 hourly ETH revenue table (with p_min
+    sweep columns added).  Streamed once by revenue_no_elasticity.py and
+    persisted at data/revenue_comparison_cache/hourly.parquet."""
+    import revenue_no_elasticity as rne                          # noqa: E402
+    hourly = rne.compute_hourly_revenue(use_cache=True)
+    return rne.add_pmin_sweep(hourly)
+
+
+def _cumulative_panel(
+    fig, daily: pl.DataFrame, *,
+    series: list[tuple[str, str, str, str]], row: int, col: int,
+    show_legend: bool,
+):
+    """Add cumulative-ETH lines for `series` (column, label, colour, dash)
+    to `fig` at (row, col).  Each line re-zeroes at the first point of
+    `daily` so 51 and 60 always start at 0."""
+    x = daily["day"].to_list()
+    for column, label, colour, dash in series:
+        cum = daily[column].cum_sum().to_numpy()
+        fig.add_trace(go.Scatter(
+            x=x, y=cum, name=label, mode="lines",
+            line=dict(color=colour, width=1.8, dash=dash),
+            legendgroup=label, showlegend=show_legend,
+            hovertemplate=(
+                "%{x|%Y-%m-%d}<br>"
+                f"{label}: " "%{y:,.1f} ETH<extra></extra>"
+            ),
+        ), row=row, col=col)
+
+
+def fig_cum_revenue_overview(hourly: pl.DataFrame) -> go.Figure:
+    """Three-panel cumulative ETH revenue: Full window | Last 90 days |
+    Last 30 days.  ArbOS 51 vs ArbOS 60 set 1 vs ArbOS 60 set 2.  All
+    three lines start at 0 ETH on the first day of each slice."""
+    if "cum_overview" in _REVENUE_FIG_CACHE:
+        return _REVENUE_FIG_CACHE["cum_overview"]
+
+    from plotly.subplots import make_subplots                    # noqa: E402
+    import revenue_no_elasticity as rne                          # noqa: E402
+    daily = rne.hourly_to_daily(hourly)
+
+    end = daily["day"].max()
+    daily_90 = daily.filter(pl.col("day") >= end - timedelta(days=90))
+    daily_30 = daily.filter(pl.col("day") >= end - timedelta(days=30))
+
+    series = [
+        ("eth_51",    "ArbOS 51",        "#d62728", "solid"),
+        ("eth_60",    "ArbOS 60 set 1",  "#1f77b4", "solid"),
+        ("eth_60_v2", "ArbOS 60 set 2",  "#17becf", "dash"),
+    ]
+    fig = make_subplots(
+        rows=1, cols=3,
+        subplot_titles=("Full window", "Last 90 days", "Last 30 days"),
+        horizontal_spacing=0.07,
+    )
+    _cumulative_panel(fig, daily,    series=series,
+                      row=1, col=1, show_legend=True)
+    _cumulative_panel(fig, daily_90, series=series,
+                      row=1, col=2, show_legend=False)
+    _cumulative_panel(fig, daily_30, series=series,
+                      row=1, col=3, show_legend=False)
+
+    for c in (1, 2, 3):
+        fig.update_yaxes(
+            title_text=("Cumulative ETH" if c == 1 else ""),
+            showline=True, linewidth=1.0, linecolor="rgba(0,0,0,0.45)",
+            mirror=True, ticks="outside", row=1, col=c,
+        )
+        fig.update_xaxes(showline=True, linewidth=1.0,
+                          linecolor="rgba(0,0,0,0.45)",
+                          mirror=True, ticks="outside", row=1, col=c)
+    fig.update_layout(
+        template="plotly_white", autosize=True, height=520,
+        margin=dict(l=70, r=30, t=70, b=50),
+        font=dict(size=12, color="#222"),
+        hovermode="x",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="center", x=0.5, font=dict(size=11),
+        ),
+    )
+    _REVENUE_FIG_CACHE["cum_overview"] = fig
+    return fig
+
+
+def fig_revenue_timeseries(hourly: pl.DataFrame,
+                           daily: pl.DataFrame) -> go.Figure:
+    """Headline hourly + daily ETH revenue, full window. 4-panel:
+        row 1: hourly 51/60 lines
+        row 2: hourly Δ (60 − 51), filled area
+        row 3: daily 51/60 lines
+        row 4: daily Δ (60 − 51), filled area
+    """
+    if "ts_full" in _REVENUE_FIG_CACHE:
+        return _REVENUE_FIG_CACHE["ts_full"]
+    from plotly.subplots import make_subplots                    # noqa: E402
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=False,
+        vertical_spacing=0.04,
+        row_heights=[0.30, 0.18, 0.30, 0.22],
+        subplot_titles=(
+            "Hourly ETH revenue",
+            "Δ hourly ETH (60 − 51)",
+            "Daily ETH revenue",
+            "Δ daily ETH (60 − 51)",
+        ),
+    )
+    h_x  = hourly["hour"].to_list()
+    h_51 = hourly["eth_51"].to_numpy()
+    h_60 = hourly["eth_60"].to_numpy()
+    d_x  = daily["day"].to_list()
+    d_51 = daily["eth_51"].to_numpy()
+    d_60 = daily["eth_60"].to_numpy()
+
+    fig.add_trace(go.Scatter(x=h_x, y=h_51, name="ArbOS 51",
+                              line=dict(color="#d62728", width=1.2),
+                              legendgroup="51", showlegend=True,
+                              hovertemplate="%{x|%Y-%m-%d %H:00}<br>"
+                              "51 = %{y:,.3f} ETH/h<extra></extra>"),
+                  row=1, col=1)
+    fig.add_trace(go.Scatter(x=h_x, y=h_60, name="ArbOS 60 set 1",
+                              line=dict(color="#1f77b4", width=1.2),
+                              legendgroup="60", showlegend=True,
+                              hovertemplate="%{x|%Y-%m-%d %H:00}<br>"
+                              "60 = %{y:,.3f} ETH/h<extra></extra>"),
+                  row=1, col=1)
+    delta_h = h_60 - h_51
+    fig.add_trace(go.Scatter(x=h_x, y=delta_h, name="Δ (60 − 51)",
+                              line=dict(color="#888", width=0.6),
+                              fill="tozeroy",
+                              fillcolor="rgba(120,120,120,0.35)",
+                              legendgroup="delta", showlegend=False),
+                  row=2, col=1)
+    fig.add_hline(y=0, line=dict(color="#444", width=0.6, dash="dot"),
+                  row=2, col=1)
+
+    fig.add_trace(go.Scatter(x=d_x, y=d_51, name="ArbOS 51 (daily)",
+                              line=dict(color="#d62728", width=1.5),
+                              legendgroup="51", showlegend=False,
+                              hovertemplate="%{x|%Y-%m-%d}<br>"
+                              "51 = %{y:,.2f} ETH/day<extra></extra>"),
+                  row=3, col=1)
+    fig.add_trace(go.Scatter(x=d_x, y=d_60, name="ArbOS 60 (daily)",
+                              line=dict(color="#1f77b4", width=1.5),
+                              legendgroup="60", showlegend=False,
+                              hovertemplate="%{x|%Y-%m-%d}<br>"
+                              "60 = %{y:,.2f} ETH/day<extra></extra>"),
+                  row=3, col=1)
+    delta_d = d_60 - d_51
+    fig.add_trace(go.Scatter(x=d_x, y=delta_d, name="Δ daily",
+                              line=dict(color="#888", width=0.8),
+                              fill="tozeroy",
+                              fillcolor="rgba(120,120,120,0.35)",
+                              showlegend=False),
+                  row=4, col=1)
+    fig.add_hline(y=0, line=dict(color="#444", width=0.6, dash="dot"),
+                  row=4, col=1)
+
+    fig.update_yaxes(title_text="ETH/h",  row=1, col=1)
+    fig.update_yaxes(title_text="Δ ETH/h", row=2, col=1)
+    fig.update_yaxes(title_text="ETH/day", row=3, col=1)
+    fig.update_yaxes(title_text="Δ ETH/day", row=4, col=1)
+    fig.update_xaxes(showline=True, linewidth=1.0,
+                      linecolor="rgba(0,0,0,0.45)",
+                      mirror=True, ticks="outside")
+    fig.update_yaxes(showline=True, linewidth=1.0,
+                      linecolor="rgba(0,0,0,0.45)",
+                      mirror=True, ticks="outside")
+    fig.update_layout(
+        template="plotly_white", autosize=True, height=820,
+        margin=dict(l=70, r=30, t=70, b=50),
+        font=dict(size=12, color="#222"),
+        hovermode="x",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="center", x=0.5, font=dict(size=11),
+        ),
+    )
+    _REVENUE_FIG_CACHE["ts_full"] = fig
+    return fig
+
+
+def fig_cum_grid(daily: pl.DataFrame) -> go.Figure:
+    """4 periods × 4 p_min cumulative ETH grid (uses
+    revenue_no_elasticity.build_cumulative_grid then strips the inner
+    title so the slide H2 reads cleanly)."""
+    if "cum_grid" in _REVENUE_FIG_CACHE:
+        return _REVENUE_FIG_CACHE["cum_grid"]
+    import revenue_no_elasticity as rne                           # noqa: E402
+    fig = rne.build_cumulative_grid(daily)
+    fig.update_layout(
+        title_text="", height=900,
+        margin=dict(l=70, r=30, t=70, b=50),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="center", x=0.5),
+        hovermode="x",
+    )
+    _REVENUE_FIG_CACHE["cum_grid"] = fig
+    return fig
+
+
+def fig_revenue_spike_zoom(hourly: pl.DataFrame,
+                            label: str, t0, t1) -> go.Figure:
+    """2-panel zoom on a spike window: 51/60 hourly line + delta."""
+    cache_key = f"spike_{label}"
+    if cache_key in _REVENUE_FIG_CACHE:
+        return _REVENUE_FIG_CACHE[cache_key]
+    from plotly.subplots import make_subplots                    # noqa: E402
+
+    sub = hourly.filter((pl.col("hour") >= t0) & (pl.col("hour") <= t1))
+    if sub.is_empty():
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_white", height=520,
+            annotations=[dict(text=f"no data in {label}",
+                              showarrow=False, xref="paper", yref="paper",
+                              x=0.5, y=0.5)],
+        )
+        _REVENUE_FIG_CACHE[cache_key] = fig
+        return fig
+
+    x   = sub["hour"].to_list()
+    y51 = sub["eth_51"].to_numpy()
+    y60 = sub["eth_60"].to_numpy()
+    delta = y60 - y51
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        vertical_spacing=0.08,
+        row_heights=[0.62, 0.38],
+        subplot_titles=(
+            f"Hourly ETH revenue: {label}",
+            "Δ L2 fee (60 − 51)",
+        ),
+    )
+    fig.add_trace(go.Scatter(x=x, y=y51, name="ArbOS 51",
+                              line=dict(color="#d62728", width=1.4),
+                              hovertemplate="%{x|%Y-%m-%d %H:00}<br>"
+                              "51 = %{y:,.3f} ETH/h<extra></extra>"),
+                  row=1, col=1)
+    fig.add_trace(go.Scatter(x=x, y=y60, name="ArbOS 60 set 1",
+                              line=dict(color="#1f77b4", width=1.4),
+                              hovertemplate="%{x|%Y-%m-%d %H:00}<br>"
+                              "60 = %{y:,.3f} ETH/h<extra></extra>"),
+                  row=1, col=1)
+    # Δ split into positive (60 above 51, grey fill) and negative
+    # (60 below 51, red fill = "underwater") so loss windows pop out.
+    delta_pos = np.where(delta >= 0, delta, 0.0)
+    delta_neg = np.where(delta <  0, delta, 0.0)
+    fig.add_trace(go.Scatter(
+        x=x, y=delta_pos, name="Δ ≥ 0", showlegend=False,
+        line=dict(color="rgba(120,120,120,0.7)", width=0.6),
+        fill="tozeroy",
+        fillcolor="rgba(120,120,120,0.35)",
+        hovertemplate="%{x|%Y-%m-%d %H:00}<br>"
+                       "Δ = +%{y:,.3f} ETH/h<extra></extra>",
+    ), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=x, y=delta_neg, name="Δ < 0", showlegend=False,
+        line=dict(color="rgba(214,39,40,0.85)", width=0.6),
+        fill="tozeroy",
+        fillcolor="rgba(214,39,40,0.30)",
+        hovertemplate="%{x|%Y-%m-%d %H:00}<br>"
+                       "Δ = %{y:,.3f} ETH/h<extra></extra>",
+    ), row=2, col=1)
+    fig.add_hline(y=0, line=dict(color="#444", width=0.6, dash="dot"),
+                  row=2, col=1)
+    fig.update_yaxes(title_text="ETH/h",  row=1, col=1)
+    fig.update_yaxes(title_text="Δ L2 fee (ETH/h)", row=2, col=1)
+    fig.update_xaxes(showline=True, linewidth=1.0,
+                      linecolor="rgba(0,0,0,0.45)",
+                      mirror=True, ticks="outside")
+    fig.update_yaxes(showline=True, linewidth=1.0,
+                      linecolor="rgba(0,0,0,0.45)",
+                      mirror=True, ticks="outside")
+    fig.update_layout(
+        template="plotly_white", autosize=True, height=520,
+        margin=dict(l=70, r=30, t=70, b=50),
+        font=dict(size=12, color="#222"),
+        hovermode="x",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="center", x=0.5, font=dict(size=11),
+        ),
+    )
+    _REVENUE_FIG_CACHE[cache_key] = fig
+    return fig
+
+
+def fig_distribution_boxplots(hourly: pl.DataFrame,
+                                daily: pl.DataFrame) -> go.Figure:
+    """3 rows × 2 cols of boxplots:
+        row 1: 51 vs 60 set 1 vs 60 set 2  (hourly | daily)
+        row 2: p_min sweep — 51 + 60 at 0.02/0.03/0.04/0.05  (hourly | daily)
+    """
+    if "boxplots" in _REVENUE_FIG_CACHE:
+        return _REVENUE_FIG_CACHE["boxplots"]
+    from plotly.subplots import make_subplots                    # noqa: E402
+    import revenue_no_elasticity as rne                           # noqa: E402
+
+    fig = make_subplots(
+        rows=2, cols=2, vertical_spacing=0.13,
+        horizontal_spacing=0.08,
+        subplot_titles=(
+            "Hourly ETH (set 1 vs set 2)",
+            "Daily ETH (set 1 vs set 2)",
+            "Hourly ETH, p_min sweep",
+            "Daily ETH, p_min sweep",
+        ),
+    )
+    # ── Row 1: set 1 vs set 2 ──────────────────────────────────────
+    for arr, name, color in (
+        (hourly["eth_51"].to_numpy(),    "ArbOS 51",         "#d62728"),
+        (hourly["eth_60"].to_numpy(),    "ArbOS 60 set 1",   "#1f77b4"),
+        (hourly["eth_60_v2"].to_numpy(), "ArbOS 60 set 2",   "#17becf"),
+    ):
+        fig.add_trace(go.Box(y=arr, name=name, marker_color=color,
+                              boxpoints="outliers", showlegend=False),
+                       row=1, col=1)
+    for arr, name, color in (
+        (daily["eth_51"].to_numpy(),    "ArbOS 51",         "#d62728"),
+        (daily["eth_60"].to_numpy(),    "ArbOS 60 set 1",   "#1f77b4"),
+        (daily["eth_60_v2"].to_numpy(), "ArbOS 60 set 2",   "#17becf"),
+    ):
+        fig.add_trace(go.Box(y=arr, name=name, marker_color=color,
+                              boxpoints="outliers", showlegend=False),
+                       row=1, col=2)
+    fig.update_yaxes(title_text="ETH/h",  row=1, col=1, type="log")
+    fig.update_yaxes(title_text="ETH/day", row=1, col=2, type="log")
+
+    # ── Row 2: p_min sweep ─────────────────────────────────────────
+    fig.add_trace(go.Box(y=hourly["eth_51"].to_numpy(),
+                          name="ArbOS 51", marker_color="#d62728",
+                          boxpoints="outliers", showlegend=False),
+                   row=2, col=1)
+    for pmin in rne.PMIN_SWEEP:
+        fig.add_trace(go.Box(
+            y=hourly[f"eth_60_pmin_{pmin:g}"].to_numpy(),
+            name=f"60, p_min={pmin:g}",
+            marker_color=rne.PMIN_COLORS[pmin],
+            boxpoints="outliers", showlegend=False,
+        ), row=2, col=1)
+    fig.add_trace(go.Box(y=daily["eth_51"].to_numpy(),
+                          name="ArbOS 51", marker_color="#d62728",
+                          boxpoints="outliers", showlegend=False),
+                   row=2, col=2)
+    for pmin in rne.PMIN_SWEEP:
+        fig.add_trace(go.Box(
+            y=daily[f"eth_60_pmin_{pmin:g}"].to_numpy(),
+            name=f"60, p_min={pmin:g}",
+            marker_color=rne.PMIN_COLORS[pmin],
+            boxpoints="outliers", showlegend=False,
+        ), row=2, col=2)
+    fig.update_yaxes(title_text="ETH/h",  row=2, col=1, type="log")
+    fig.update_yaxes(title_text="ETH/day", row=2, col=2, type="log")
+
+    fig.update_xaxes(showline=True, linewidth=1.0,
+                      linecolor="rgba(0,0,0,0.45)",
+                      mirror=True, ticks="outside")
+    fig.update_yaxes(showline=True, linewidth=1.0,
+                      linecolor="rgba(0,0,0,0.45)",
+                      mirror=True, ticks="outside")
+    fig.update_layout(
+        template="plotly_white", autosize=True, height=820,
+        margin=dict(l=70, r=30, t=70, b=50),
+        font=dict(size=12, color="#222"),
+    )
+    _REVENUE_FIG_CACHE["boxplots"] = fig
+    return fig
+
+
+def revenue_summary_tables_html(hourly: pl.DataFrame,
+                                  daily: pl.DataFrame) -> str:
+    """Stats table (per window) + p_min sweep table — both produced by
+    revenue_no_elasticity.py.  Side by side under .revenue-tables."""
+    import revenue_no_elasticity as rne                           # noqa: E402
+    stats = rne.build_stats_table(hourly, daily)
+    sweep = rne.build_pmin_sweep_table(hourly)
+    return (
+        '<div class="revenue-tables">'
+        '  <div class="rev-table-block">'
+        '    <h3>Window summary (51 vs 60, ETH)</h3>'
+        f'    {stats}'
+        '  </div>'
+        '  <div class="rev-table-block">'
+        '    <h3>Full-window totals, p<sub>min</sub> sweep</h3>'
+        f'    {sweep}'
+        '  </div>'
+        '</div>'
+    )
+
+
+def fig_cum_revenue_pmin_sweep(hourly: pl.DataFrame) -> go.Figure:
+    """Cumulative ETH revenue for the ArbOS 60 p_min sweep (0.02 / 0.03 /
+    0.04 / 0.05 gwei) vs ArbOS 51, two panels: Full window | Last 30D."""
+    if "cum_pmin" in _REVENUE_FIG_CACHE:
+        return _REVENUE_FIG_CACHE["cum_pmin"]
+
+    from plotly.subplots import make_subplots                    # noqa: E402
+    import revenue_no_elasticity as rne                          # noqa: E402
+    daily = rne.hourly_to_daily(hourly)
+    end = daily["day"].max()
+    daily_90 = daily.filter(pl.col("day") >= end - timedelta(days=90))
+    daily_30 = daily.filter(pl.col("day") >= end - timedelta(days=30))
+
+    series = [("eth_51", "ArbOS 51", "#d62728", "solid")]
+    for pmin in rne.PMIN_SWEEP:
+        series.append((
+            f"eth_60_pmin_{pmin:g}",
+            f"ArbOS 60, p_min = {pmin:g} gwei",
+            rne.PMIN_COLORS[pmin], "solid",
+        ))
+
+    fig = make_subplots(
+        rows=1, cols=3,
+        subplot_titles=("Full window", "Last 90 days", "Last 30 days"),
+        horizontal_spacing=0.07,
+    )
+    _cumulative_panel(fig, daily,    series=series,
+                      row=1, col=1, show_legend=True)
+    _cumulative_panel(fig, daily_90, series=series,
+                      row=1, col=2, show_legend=False)
+    _cumulative_panel(fig, daily_30, series=series,
+                      row=1, col=3, show_legend=False)
+    for c in (1, 2, 3):
+        fig.update_yaxes(
+            title_text=("Cumulative ETH" if c == 1 else ""),
+            showline=True, linewidth=1.0, linecolor="rgba(0,0,0,0.45)",
+            mirror=True, ticks="outside", row=1, col=c,
+        )
+        fig.update_xaxes(showline=True, linewidth=1.0,
+                          linecolor="rgba(0,0,0,0.45)",
+                          mirror=True, ticks="outside", row=1, col=c)
+    fig.update_layout(
+        template="plotly_white", autosize=True, height=520,
+        margin=dict(l=70, r=30, t=70, b=50),
+        font=dict(size=12, color="#222"),
+        hovermode="x",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="center", x=0.5, font=dict(size=11),
+        ),
+    )
+    _REVENUE_FIG_CACHE["cum_pmin"] = fig
+    return fig
+
+
+def revenue_no_elasticity_slide_html() -> str:
+    """Top-level <section> for the ArbOS 60 vs 51 first-glance comparison
+    (no demand elasticity).  Vertical sub-slides cover:
+        1. Intro / what we are doing.
+        2. Hourly + daily revenue time series + deltas.
+        3. Cumulative ETH revenue overview.
+        4. ArbOS 60 p_min sweep, cumulative ETH.
+        5. Cumulative grid (4 periods × 4 p_min).
+        6. Spike-window zoom (Jan 29 to Feb 7).
+        7. Distribution boxplots.
+        8. Summary tables.
+    """
+    print("Loading revenue-comparison hourly cache (slide 7)...")
+    t0 = time.time()
+    hourly = _load_revenue_hourly()
+    import revenue_no_elasticity as rne                           # noqa: E402
+    daily  = rne.hourly_to_daily(hourly)
+    # ts figure dropped — slide removed.  Function kept for reference.
+    # f_ts     = fig_revenue_timeseries(hourly, daily)
+    f_cum    = fig_cum_revenue_overview(hourly)
+    f_pmin   = fig_cum_revenue_pmin_sweep(hourly)
+    f_grid   = fig_cum_grid(daily)
+    f_box    = fig_distribution_boxplots(hourly, daily)
+    spike_label, spike_t0, spike_t1 = rne.SPIKE_WINDOWS[0]
+    f_spike  = fig_revenue_spike_zoom(hourly, spike_label,
+                                       spike_t0, spike_t1)
+    tables_html = revenue_summary_tables_html(hourly, daily)
+    print(f"  built revenue figures in {time.time()-t0:.2f}s")
+
+    intro_section = (
+        '<section class="chart-stats-slide intro-revenue">'
+        '  <h2>ArbOS 60 vs ArbOS 51: revenue, no demand elasticity modeling</h2>'
+        '  <div class="intro-card">'
+        '    <div class="intro-card-tag">What this section does</div>'
+        '    <p>We replay every priced transaction in the dataset and '
+        '       re-compute its fee under each pricing regime, keeping '
+        '       the realised gas usage fixed. Only the pricing function '
+        '       changes, users transact identically: this is a clean '
+        '       counterfactual on the actual on-chain workload.</p>'
+        '    <p><b>Demand elasticity is off.</b> Price feedback into '
+        '       user behaviour is added in the next section.</p>'
+        '  </div>'
+        '  <div class="intro-card">'
+        '    <div class="intro-card-tag">What follows</div>'
+        '    <ul class="intro-points">'
+        '      <li><b>Spike-window zoom</b>: Jan 29 to Feb 7, the '
+        '          most pronounced congestion in the dataset.</li>'
+        '      <li><b>Cumulative ETH</b> per window: full / 90D / 30D, '
+        '          ArbOS 51 vs 60 set 1 vs set 2.</li>'
+        '      <li><b>p<sub>min</sub> sweep</b>: 0.02, 0.03, 0.04, '
+        '          0.05 gwei across ArbOS 60.</li>'
+        '      <li><b>Cumulative grid</b>: 4 windows × 4 '
+        '          p<sub>min</sub> values.</li>'
+        '      <li><b>Distribution boxplots</b>: hourly + daily ETH, '
+        '          set 1 vs set 2 + p<sub>min</sub> sweep.</li>'
+        '      <li><b>Summary tables</b>: window-by-window totals + '
+        '          p<sub>min</sub> sweep totals.</li>'
+        '    </ul>'
+        '  </div>'
+        '</section>'
+    )
+    cum_section = (
+        '<section class="chart-stats-slide">'
+        '  <h2>Cumulative ETH revenue, 51 vs 60</h2>'
+        '  <div class="slide-note">'
+        '    <b>Data.</b> Cumulative ETH from day zero of each slice. '
+        '    51 (red), 60 set 1 (blue), 60 set 2 (cyan, dashed). Both '
+        '    at p<sub>min</sub> = 0.02 gwei.<br>'
+        '    <b>Result.</b> Set 1 and set 2 are within a few percent '
+        '    of each other; both gain meaningfully on 51 over the '
+        '    full window, less so over the last 90 days.'
+        '  </div>'
+        f' <div class="hist-grid">{fig_div(f_cum, "fig-cum-overview")}</div>'
+        '</section>'
+    )
+    pmin_section = (
+        '<section class="chart-stats-slide">'
+        '  <h2>ArbOS 60 p<sub>min</sub> sweep, cumulative ETH</h2>'
+        '  <div class="slide-note">'
+        '    <b>Data.</b> Same usage, ArbOS 60 set 1 priced at '
+        '    p<sub>min</sub> ∈ '
+        '    {0.02, 0.03, 0.04, 0.05} gwei, vs 51 baseline (red).<br>'
+        '    <b>Result.</b> Revenue scales linearly in p<sub>min</sub>: '
+        '    the price exponent depends on inflow / target only, so '
+        '    p<sub>min</sub> is a clean revenue knob.'
+        '  </div>'
+        f' <div class="hist-grid">{fig_div(f_pmin, "fig-cum-pmin")}</div>'
+        '</section>'
+    )
+    grid_section = (
+        '<section class="chart-stats-slide">'
+        '  <h2>Cumulative ETH: 4 windows × 4 p<sub>min</sub></h2>'
+        '  <div class="slide-note">'
+        '    <b>Data.</b> Each panel = one (window, p<sub>min</sub>) '
+        '    pair, 51 vs 60 set 1.<br>'
+        '    <b>Result.</b> The crossover point where 60 catches and '
+        '    overtakes 51 happens earlier as p<sub>min</sub> rises; '
+        '    on the 7-day window 60 only beats 51 from p<sub>min</sub> '
+        '    ≳ 0.04 gwei.'
+        '  </div>'
+        f' <div class="hist-grid">{fig_div(f_grid, "fig-cum-grid")}</div>'
+        '</section>'
+    )
+    spike_section = (
+        '<section class="chart-stats-slide">'
+        '  <h2>Hourly fees re-priced with ArbOS 60: spike window</h2>'
+        '  <div class="slide-note">'
+        '    We replay every priced tx in the network and re-compute '
+        '    its fee under ArbOS 60 with the realised gas usage. '
+        '    Below: hourly aggregate of the re-priced tx fees across '
+        '    the whole network, for the Jan 29 to Feb 7 spike window. '
+        '    51 (red), 60 set 1 (blue), gap (60 − 51) at the bottom.'
+        '  </div>'
+        f' <div class="hist-grid">{fig_div(f_spike, "fig-rev-spike")}</div>'
+        '</section>'
+    )
+    box_section = (
+        '<section class="chart-stats-slide">'
+        '  <h2>Distribution shape: hourly and daily ETH</h2>'
+        '  <div class="slide-note">'
+        '    <b>Data.</b> Top row, set 1 vs set 2 (vs 51). Bottom row, '
+        '    51 vs 60 across the p<sub>min</sub> sweep. Log-y on all '
+        '    boxes.<br>'
+        '    <b>Result.</b> The median shifts up under 60 in every '
+        '    panel; the upper-tail outliers are where the cumulative '
+        '    advantage accrues.'
+        '  </div>'
+        f' <div class="hist-grid">{fig_div(f_box, "fig-rev-box")}</div>'
+        '</section>'
+    )
+    tables_section = (
+        '<section class="chart-stats-slide">'
+        '  <h2>Summary tables</h2>'
+        '  <div class="slide-note">'
+        '    <b>Data.</b> Window-by-window ETH totals + per-resource '
+        '    p<sub>min</sub> sweep totals over the full window.<br>'
+        '    <b>Result.</b> ArbOS 60 set 1 picks up roughly +50% over '
+        '    the full window at the on-chain p<sub>min</sub> = 0.02 '
+        '    gwei; the gain compounds super-linearly as p<sub>min</sub> '
+        '    rises (revenue is linear, baseline is fixed).'
+        '  </div>'
+        f' {tables_html}'
+        '</section>'
+    )
+    return (
+        '<section>\n'
+        f'  {intro_section}\n'
+        f'  {spike_section}\n'
+        f'  {cum_section}\n'
+        f'  {pmin_section}\n'
+        f'  {grid_section}\n'
+        f'  {box_section}\n'
+        f'  {tables_section}\n'
+        '</section>'
+    )
+
+
+# ── ArbOS 60 capacity headroom (slide 8) ────────────────────────────────────
+_CAPACITY_FIG_CACHE: dict[str, go.Figure] = {}
+
+
+def _load_capacity_summaries():
+    """Returns (prices_hr, cap_hr, cap_hr_mix) — first call may take a few
+    minutes if the per-second caches aren't already on disk; subsequent
+    calls hit only the parquet caches."""
+    import capacity_estimator as cap                              # noqa: E402
+    return cap.compute_or_load_capacity_summaries()
+
+
+def fig_capacity_prices(prices_hr: pl.DataFrame) -> go.Figure:
+    """Per-resource simulated ArbOS 60 prices (gwei, log y)."""
+    if "prices" in _CAPACITY_FIG_CACHE:
+        return _CAPACITY_FIG_CACHE["prices"]
+    import capacity_estimator as cap                              # noqa: E402
+
+    fig = go.Figure()
+    x = prices_hr["hour"].to_list()
+    for k in cap.RESOURCES:
+        fig.add_trace(go.Scatter(
+            x=x, y=prices_hr[f"p_{k}"].to_numpy(),
+            name=cap.RESOURCE_LABEL[k],
+            line=dict(color=cap.RESOURCE_COLOR[k], width=1.2),
+            hovertemplate=("%{x|%Y-%m-%d %H:00}<br>"
+                           f"p_{{{k}}} = " "%{y:.4f} gwei<extra></extra>"),
+        ))
+    fig.add_hline(y=cap.P_MIN_GWEI,
+                  line=dict(color="#444", width=0.8, dash="dot"),
+                  annotation_text=f"p_min = {cap.P_MIN_GWEI} gwei",
+                  annotation_position="bottom right",
+                  annotation_font=dict(size=10, color="#444"))
+    dia_ms = int(cap.DIA_LAUNCH_TS.timestamp() * 1000)
+    fig.add_vline(x=dia_ms, line=dict(color="#444", width=1.0, dash="dash"),
+                  annotation_text="DIA", annotation_position="top right",
+                  annotation_font=dict(size=10, color="#444"))
+    fig.update_yaxes(title_text="gwei", type="log",
+                     showline=True, linewidth=1.0,
+                     linecolor="rgba(0,0,0,0.45)",
+                     mirror=True, ticks="outside")
+    fig.update_xaxes(showline=True, linewidth=1.0,
+                     linecolor="rgba(0,0,0,0.45)",
+                     mirror=True, ticks="outside")
+    fig.update_layout(
+        template="plotly_white", autosize=True, height=520,
+        margin=dict(l=70, r=30, t=70, b=50),
+        font=dict(size=12, color="#222"),
+        hovermode="x",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="center", x=0.5, font=dict(size=11),
+        ),
+    )
+    _CAPACITY_FIG_CACHE["prices"] = fig
+    return fig
+
+
+def _capacity_view_panel(
+    cap_hr: pl.DataFrame, *, mix_label: str,
+) -> go.Figure:
+    """3-row figure: capacity, headroom, gain Δ%.  Each panel shows
+    ArbOS 60 Set 1 (solid blue) and Set 2 (dashed teal); ArbOS 51
+    (red dashed) appears in capacity + headroom as a baseline.  Window
+    is clipped to ArbOS 51 DIA activation."""
+    import capacity_estimator as cap                              # noqa: E402
+    from plotly.subplots import make_subplots                     # noqa: E402
+
+    cap_hr = cap_hr.filter(pl.col("hour") >= cap.DIA_LAUNCH_TS)
+
+    has_v2 = "cap_60_v2" in cap_hr.columns
+    x = cap_hr["hour"].to_list()
+
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True,
+        vertical_spacing=0.06,
+        row_heights=[0.34, 0.33, 0.33],
+        subplot_titles=(
+            f"Capacity (Mgas/s, {mix_label})",
+            f"Spare capacity % ({mix_label})",
+            "Capacity gain Δ% vs ArbOS 51",
+        ),
+    )
+
+    # ── Row 1: capacity in Mgas/s ────────────────────────────────────
+    fig.add_trace(go.Scatter(
+        x=x, y=cap_hr["cap_51"].to_numpy(), name="ArbOS 51",
+        line=dict(color="#d62728", width=1.4, dash="dash"),
+        hovertemplate=("%{x|%Y-%m-%d %H:00}<br>"
+                       "cap 51 = %{y:.1f} Mgas/s<extra></extra>"),
+        legendgroup="51", showlegend=True,
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=x, y=cap_hr["cap_60"].to_numpy(), name="ArbOS 60 set 1",
+        line=dict(color="#1f77b4", width=1.6),
+        hovertemplate=("%{x|%Y-%m-%d %H:00}<br>"
+                       "cap 60 set 1 = %{y:.1f} Mgas/s<extra></extra>"),
+        legendgroup="60v1", showlegend=True,
+    ), row=1, col=1)
+    if has_v2:
+        fig.add_trace(go.Scatter(
+            x=x, y=cap_hr["cap_60_v2"].to_numpy(), name="ArbOS 60 set 2",
+            line=dict(color="#17becf", width=1.6, dash="dot"),
+            hovertemplate=("%{x|%Y-%m-%d %H:00}<br>"
+                           "cap 60 set 2 = %{y:.1f} Mgas/s<extra></extra>"),
+            legendgroup="60v2", showlegend=True,
+        ), row=1, col=1)
+
+    # ── Row 2: headroom % ────────────────────────────────────────────
+    fig.add_trace(go.Scatter(
+        x=x, y=cap_hr["headroom_51"].to_numpy(), name="ArbOS 51",
+        line=dict(color="#d62728", width=1.4, dash="dash"),
+        hovertemplate=("%{x|%Y-%m-%d %H:00}<br>"
+                       "spare 51 = %{y:.1f}%<extra></extra>"),
+        legendgroup="51", showlegend=False,
+    ), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=x, y=cap_hr["headroom_60"].to_numpy(), name="ArbOS 60 set 1",
+        line=dict(color="#1f77b4", width=1.6),
+        hovertemplate=("%{x|%Y-%m-%d %H:00}<br>"
+                       "spare 60 set 1 = %{y:.1f}%<extra></extra>"),
+        legendgroup="60v1", showlegend=False,
+    ), row=2, col=1)
+    if has_v2:
+        fig.add_trace(go.Scatter(
+            x=x, y=cap_hr["headroom_60_v2"].to_numpy(), name="ArbOS 60 set 2",
+            line=dict(color="#17becf", width=1.6, dash="dot"),
+            hovertemplate=("%{x|%Y-%m-%d %H:00}<br>"
+                           "spare 60 set 2 = %{y:.1f}%<extra></extra>"),
+            legendgroup="60v2", showlegend=False,
+        ), row=2, col=1)
+
+    # ── Row 3: gain Δ% over ArbOS 51 ─────────────────────────────────
+    gain_v1 = (cap_hr["gain_median"].to_numpy()
+               if "gain_median" in cap_hr.columns
+               else cap_hr["gain_60"].to_numpy())
+    fig.add_trace(go.Scatter(
+        x=x, y=gain_v1, name="ArbOS 60 set 1 gain",
+        line=dict(color="#1f77b4", width=1.6),
+        hovertemplate=("%{x|%Y-%m-%d %H:00}<br>"
+                       "gain set 1 = %{y:+.1f}%<extra></extra>"),
+        legendgroup="60v1", showlegend=False,
+    ), row=3, col=1)
+    if has_v2:
+        gain_v2 = (cap_hr["gain_median_v2"].to_numpy()
+                   if "gain_median_v2" in cap_hr.columns
+                   else cap_hr["gain_60_v2"].to_numpy())
+        fig.add_trace(go.Scatter(
+            x=x, y=gain_v2, name="ArbOS 60 set 2 gain",
+            line=dict(color="#17becf", width=1.6, dash="dot"),
+            hovertemplate=("%{x|%Y-%m-%d %H:00}<br>"
+                           "gain set 2 = %{y:+.1f}%<extra></extra>"),
+            legendgroup="60v2", showlegend=False,
+        ), row=3, col=1)
+    fig.add_hline(y=0, row=3, col=1,
+                  line=dict(color="#444", width=0.8, dash="dot"),
+                  annotation_text="parity",
+                  annotation_position="bottom right",
+                  annotation_font=dict(size=10, color="#666"))
+
+    fig.update_yaxes(title_text="Mgas/s", row=1, col=1, rangemode="tozero")
+    fig.update_yaxes(title_text="% spare capacity",
+                     row=2, col=1, range=[0, 100])
+    fig.update_yaxes(title_text="Δ% vs ArbOS 51", row=3, col=1)
+    fig.update_xaxes(showline=True, linewidth=1.0,
+                     linecolor="rgba(0,0,0,0.45)",
+                     mirror=True, ticks="outside")
+    fig.update_yaxes(showline=True, linewidth=1.0,
+                     linecolor="rgba(0,0,0,0.45)",
+                     mirror=True, ticks="outside")
+    fig.update_layout(
+        template="plotly_white", autosize=True, height=760,
+        margin=dict(l=70, r=30, t=70, b=50),
+        font=dict(size=12, color="#222"),
+        hovermode="x",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="center", x=0.5, font=dict(size=11),
+        ),
+    )
+    return fig
+
+
+def fig_capacity_per_second_mix(cap_hr: pl.DataFrame) -> go.Figure:
+    if "per_sec_mix" in _CAPACITY_FIG_CACHE:
+        return _CAPACITY_FIG_CACHE["per_sec_mix"]
+    fig = _capacity_view_panel(cap_hr, mix_label="per-second mix")
+    _CAPACITY_FIG_CACHE["per_sec_mix"] = fig
+    return fig
+
+
+def fig_capacity_daily_ma(
+    cap_hr: pl.DataFrame, *, ma_window: int = 7,
+) -> go.Figure:
+    """Same 3-row capacity figure, but each series is the daily mean
+    smoothed by a centred moving average (default 7 days).  Reads the
+    same per-second-mix hourly summary; aggregation is hour → day mean,
+    then rolling mean."""
+    if "daily_ma" in _CAPACITY_FIG_CACHE:
+        return _CAPACITY_FIG_CACHE["daily_ma"]
+    import capacity_estimator as cap                              # noqa: E402
+
+    df = cap_hr.filter(pl.col("hour") >= cap.DIA_LAUNCH_TS)
+    metric_cols = [
+        "cap_51", "cap_60", "cap_60_v2",
+        "headroom_51", "headroom_60", "headroom_60_v2",
+        "gain_median", "gain_median_v2",
+    ]
+    metric_cols = [c for c in metric_cols if c in df.columns]
+    daily = (
+        df.with_columns(pl.col("hour").dt.truncate("1d").alias("day"))
+          .group_by("day")
+          .agg([pl.col(c).mean().alias(c) for c in metric_cols])
+          .sort("day")
+    )
+    smoothed = daily.with_columns([
+        pl.col(c).rolling_mean(window_size=ma_window, center=True,
+                                min_samples=1).alias(c)
+        for c in metric_cols
+    ])
+    fig = _capacity_view_panel(
+        smoothed.rename({"day": "hour"}),
+        mix_label=f"daily mean, {ma_window}-day moving average",
+    )
+    _CAPACITY_FIG_CACHE["daily_ma"] = fig
+    return fig
+
+
+def fig_capacity_hourly_mix(cap_hr_mix: pl.DataFrame) -> go.Figure:
+    if "hourly_mix" in _CAPACITY_FIG_CACHE:
+        return _CAPACITY_FIG_CACHE["hourly_mix"]
+    fig = _capacity_view_panel(cap_hr_mix, mix_label="hourly-averaged mix")
+    _CAPACITY_FIG_CACHE["hourly_mix"] = fig
+    return fig
+
+
+def capacity_slide_html() -> str:
+    """Top-level <section> for ArbOS 60 capacity headroom.  Vertical
+    sub-slides:
+        1. Methodology / Ben's framing + math.
+        2. Per-resource simulated prices.
+        3. Capacity gain + headroom + saturation, per-second mix.
+        4. Capacity gain + headroom + saturation, hourly-averaged mix.
+    """
+    print("Loading capacity caches (slide 8)...")
+    t0 = time.time()
+    prices_hr, cap_hr, cap_hr_mix = _load_capacity_summaries()
+    print(f"  capacity caches loaded in {time.time()-t0:.2f}s")
+    f_persec = fig_capacity_per_second_mix(cap_hr)
+    f_daily  = fig_capacity_daily_ma(cap_hr)
+    print(f"  built capacity figures in {time.time()-t0:.2f}s")
+
+    def eq(latex: str) -> str:
+        """Wrap a display equation in `.method-eq` (already in MathJax's
+        processHtmlClass list, so it always renders inside the deck)."""
+        return f'<div class="method-eq">\\[{latex}\\]</div>'
+
+    methodology = (
+        '<section class="chart-stats-slide capacity-intro">'
+        '  <h2>Capacity, spare and gain: ArbOS 60 vs ArbOS 51</h2>'
+        '  <div class="capacity-definition">'
+        '    <div class="who">Definition</div>'
+        '    Capacity is the gas-per-second throughput at which the '
+        '    price first starts rising above <code>p<sub>min</sub></code>. '
+        '    In ArbOS 51 it is constant (10 Mgas/s post-DIA). In '
+        '    ArbOS 60 it depends on the workload mix: on set 2 the '
+        '    price starts rising around G ≈ 15 Mgas/s, about a 50 % '
+        '    capacity gain on average.'
+        '  </div>'
+        '  <div class="methodology">'
+        '    <ol>'
+        '      <li><b>Per-second aggregation.</b> Bucket every block '
+        '          into 1 s windows. Per second t, per-resource gas '
+        '          g<sub>k</sub>(t), total gas G(t) and mix '
+        '          α<sub>k</sub>(t) = g<sub>k</sub>(t) / G(t).</li>'
+        '      <li><b>ArbOS 60 capacity</b> (mix-dependent). Smallest '
+        '          constraint j = 0 binds for sustained throughput:'
+        f'         {eq(r"\text{capacity}_{60}(t) = \min_{i} \frac{T_{i,0}}{\sum_{k} a_{i,k} \, \alpha_{k}(t)}")}'
+        '      </li>'
+        '      <li><b>ArbOS 51 capacity</b> is constant per regime: '
+        '          7 Mgas/s pre-DIA, 10 Mgas/s post-DIA.</li>'
+        '      <li><b>Spare capacity</b> is the share of the ceiling '
+        '          left unused at a given second:'
+        f'         {eq(r"\text{spare}(t) = \frac{\text{capacity}(t) - G(t)}{\text{capacity}(t)} \times 100\%")}'
+        '      </li>'
+        '      <li><b>Capacity gain Δ%</b> is the relative gain of '
+        '          ArbOS 60 over the constant ArbOS 51 ceiling:'
+        f'         {eq(r"\Delta(t) = \frac{\text{capacity}_{60}(t) - \text{capacity}_{51}}{\text{capacity}_{51}} \times 100\%")}'
+        '      </li>'
+        '    </ol>'
+        '  </div>'
+        '</section>'
+    )
+    persec_section = (
+        '<section class="chart-stats-slide">'
+        '  <h2>Capacity, per-second mix</h2>'
+        '  <div class="slide-note">'
+        '    Capacity recomputed every second from the realised '
+        '    α<sub>k</sub>(t); panel metrics are hourly means of '
+        '    the per-second values. Dashed line = ArbOS 51, solid '
+        '    line = ArbOS 60.'
+        '  </div>'
+        f' <div class="hist-grid">{fig_div(f_persec, "fig-cap-per-sec")}</div>'
+        '</section>'
+    )
+    daily_section = (
+        '<section class="chart-stats-slide">'
+        '  <h2>Capacity, daily 7-day moving average</h2>'
+        '  <div class="slide-note">'
+        '    Same three metrics as the per-second view, aggregated to '
+        '    daily means and smoothed with a 7-day centred rolling '
+        '    average. Dashed line = ArbOS 51, solid = ArbOS 60 set 1, '
+        '    dotted = ArbOS 60 set 2.'
+        '  </div>'
+        f' <div class="hist-grid">{fig_div(f_daily, "fig-cap-daily-ma")}</div>'
+        '</section>'
+    )
+    return (
+        '<section>\n'
+        f'  {methodology}\n'
+        f'  {persec_section}\n'
+        f'  {daily_section}\n'
+        '</section>'
+    )
+
+
+# ── Transaction clustering (slide 9) ────────────────────────────────────────
+_CLUSTERING_FIG_CACHE: dict[str, go.Figure] = {}
+TSNE_CACHE       = _ROOT / "data" / "clustering_cache" / "tsne_xy.npz"
+TSNE_LARGE_CACHE = _ROOT / "data" / "clustering_cache" / "tsne_large.npz"
+# t-SNE sample size — kept small for fast iteration.  20 K pts at the
+# default perplexity converges in ~30-60 s on this machine.  Bump to
+# 100 K+ when you want higher visual resolution and can wait.
+TSNE_LARGE_N    = 20_000
+
+
+def _stream_clr_sample(n_target: int, seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
+    """Reservoir-sample `n_target` txs from the per-tx parquets and
+    return their X_clr feature matrix.  Streams once over the full
+    ~594 M-row dataset (~3 min cold cache).  Re-uses the same CLR
+    transform as `tx_clustering._featurize_batch` so the resulting
+    vectors are interchangeable with the saved fit's feature space."""
+    import tx_clustering as txc                                   # noqa: E402
+
+    rng    = np.random.default_rng(seed)
+    paths  = txc._per_tx_files()
+    if not paths:
+        raise FileNotFoundError("no per-tx parquets found "
+                                 f"under {txc.MULTIGAS_DIR}")
+    res_X  = np.empty((n_target, 7), dtype=np.float64)
+    n_seen = 0   # priced txs encountered so far across all chunks
+    n_kept = 0
+    print(f"  streaming {n_target:,} priced-tx CLR sample "
+           "from per-tx parquets...")
+    t0 = time.time()
+    for batch in txc._iter_chunks(paths):
+        out = txc._featurize_batch(batch)
+        if out is None:
+            continue
+        _, _, _, X_clr, _ = out
+        # Apply the same outlier trim as the original fit pass.
+        # (The per-dim CLR bounds are saved in fit.pkl as `clr_lo`/`clr_hi`.)
+        n_b = X_clr.shape[0]
+        # Reservoir sampling, vectorised.
+        if n_kept < n_target:
+            take = min(n_b, n_target - n_kept)
+            res_X[n_kept:n_kept + take] = X_clr[:take]
+            n_kept += take
+            # Vitter-style replacement for the rest of the chunk.
+            if take < n_b:
+                rest = X_clr[take:]
+                # Each row in `rest` should replace a random current
+                # element with prob target/n_seen_after_inclusion.
+                idx_global = np.arange(n_seen + take, n_seen + n_b)
+                replace_idx = rng.integers(0, idx_global + 1)
+                # Only positions < n_target replace; pick the matching
+                # rows from `rest`.
+                mask = replace_idx < n_target
+                res_X[replace_idx[mask]] = rest[mask]
+        else:
+            idx_global = np.arange(n_seen, n_seen + n_b)
+            replace_idx = rng.integers(0, idx_global + 1)
+            mask = replace_idx < n_target
+            res_X[replace_idx[mask]] = X_clr[mask]
+        n_seen += n_b
+    print(f"  reservoir done in {time.time()-t0:.1f}s "
+           f"(scanned {n_seen:,} priced txs, kept {n_kept:,})")
+    return res_X[:n_kept]
+
+
+def _compute_or_load_tsne_large(n_target: int = TSNE_LARGE_N
+                                  ) -> tuple[np.ndarray, np.ndarray]:
+    """Cached Barnes-Hut t-SNE on a large fresh CLR reservoir sample.
+    Returns (xy, labels).  Cache: data/clustering_cache/tsne_large.npz."""
+    if TSNE_LARGE_CACHE.exists():
+        z = np.load(TSNE_LARGE_CACHE)
+        if int(z["n"]) == n_target:
+            print(f"  loading cached large t-SNE: {TSNE_LARGE_CACHE}")
+            return z["xy"], z["labels"]
+        print(f"  large-t-SNE cache size mismatch (cached n={int(z['n'])}, "
+              f"requested {n_target}) — recomputing")
+
+    import tx_clustering as txc                                   # noqa: E402
+    import pickle
+    from sklearn.manifold import TSNE                              # noqa: E402
+
+    X_clr = _stream_clr_sample(n_target)
+    with open(_ROOT / "data" / "clustering_cache" / "fit.pkl", "rb") as f:
+        fit = pickle.load(f)
+    K_chosen = int(txc.K_LOG)
+    mbk      = fit["mbk"][K_chosen]
+    labels   = mbk.predict(X_clr).astype(np.int8)
+
+    print(f"  computing t-SNE on {X_clr.shape[0]:,} pts "
+           "(Barnes-Hut, this takes 10-30 min)...")
+    t0 = time.time()
+    # Plain default-ish t-SNE.  20 K pts converges in ~30-60 s; using
+    # default perplexity / exaggeration / iters since aggressive tuning
+    # didn't separate the CLR clusters any better and just slowed the
+    # whole thing down.
+    xy = TSNE(
+        n_components=2, perplexity=50,
+        init="pca", learning_rate="auto",
+        method="barnes_hut",
+        random_state=42, n_jobs=-1,
+    ).fit_transform(X_clr)
+    print(f"  large t-SNE done in {time.time()-t0:.1f}s")
+    TSNE_LARGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        TSNE_LARGE_CACHE,
+        xy=xy.astype(np.float32),
+        labels=labels.astype(np.int8),
+        n=np.int64(X_clr.shape[0]),
+    )
+    print(f"  cached → {TSNE_LARGE_CACHE}")
+    return xy.astype(np.float32), labels.astype(np.int8)
+
+
+def _load_clustering_cache():
+    """Returns dict with: features (X_clr, Lg arrays), sample (polars df),
+    fit (mbk dict, metrics dict, auto_K), aggs (n_txs, vol_sum,
+    n_spam_label, loggas_hist, loggas_edges), K (the locked K used by
+    plot_phase, defaults to tx_clustering.K_LOG)."""
+    import pickle
+    import tx_clustering as txc                                   # noqa: E402
+
+    feats = np.load(_ROOT / "data" / "clustering_cache" / "features.npz")
+    sample = pl.read_parquet(_ROOT / "data" / "clustering_cache" / "sample.parquet")
+    with open(_ROOT / "data" / "clustering_cache" / "fit.pkl", "rb") as f:
+        fit = pickle.load(f)
+    aggs = np.load(_ROOT / "data" / "clustering_cache" / "aggs.npz")
+    return {
+        "X_clr":   feats["X_clr"],
+        "Lg":      feats["Lg"],
+        "sample":  sample,
+        "fit":     fit,
+        "aggs":    {k: aggs[k] for k in aggs.files},
+        "K":       int(txc.K_LOG),
+        "txc":     txc,
+    }
+
+
+def _compute_or_load_tsne(X_clr: np.ndarray, n_tsne: int = 30_000):
+    """Cached Barnes-Hut t-SNE on a sub-sample of X_clr (deterministic seed).
+    Cache file: data/clustering_cache/tsne_xy.npz."""
+    if TSNE_CACHE.exists():
+        z = np.load(TSNE_CACHE)
+        if int(z["n"]) == n_tsne:
+            print(f"  loading cached t-SNE: {TSNE_CACHE}")
+            return z["xy"], z["idx"]
+        print(f"  t-SNE cache size mismatch (cached n={int(z['n'])}, "
+              f"requested {n_tsne}) — recomputing")
+
+    print(f"  computing t-SNE on {n_tsne:,} pts (Barnes-Hut)...")
+    from sklearn.manifold import TSNE                              # noqa: E402
+    rng = np.random.default_rng(42)
+    n = min(n_tsne, X_clr.shape[0])
+    idx = rng.choice(X_clr.shape[0], size=n, replace=False)
+    t0 = time.time()
+    xy = TSNE(n_components=2, perplexity=50, init="pca",
+              learning_rate="auto", random_state=42, n_jobs=-1).fit_transform(
+                  X_clr[idx])
+    print(f"  t-SNE done in {time.time()-t0:.1f}s")
+    TSNE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(TSNE_CACHE, xy=xy.astype(np.float32),
+                         idx=idx.astype(np.int64), n=np.int64(n))
+    print(f"  cached → {TSNE_CACHE}")
+    return xy.astype(np.float32), idx.astype(np.int64)
+
+
+# Cluster palette is intentionally disjoint from the resource palette
+# (Computation = #1f77b4, Storage Write = #2ca02c, Storage Read = #98df8a,
+#  Storage Growth = #d62728, History Growth = #ff7f0e, L2 Calldata = #9467bd,
+#  L1 Calldata = #e377c2) so the eye doesn't read a cluster colour as a
+# resource. Material-design / Tableau extended hues, all distinct from
+# the resource set.
+_CLUSTER_PALETTE = [
+    "#00838f",   # c0 — dark teal
+    "#5e35b1",   # c1 — deep purple
+    "#c2185b",   # c2 — magenta
+    "#fbc02d",   # c3 — gold
+    "#455a64",   # c4 — slate
+    "#3949ab",   # c5 — indigo (only used if K > 5)
+    "#6d4c41",   # c6 — brown
+    "#827717",   # c7 — olive
+    "#0288d1",   # c8 — cyan
+    "#7b1fa2",   # c9 — violet
+]
+
+
+def fig_clustering_tsne_and_k() -> go.Figure:
+    """Combined viz: row 1 = t-SNE scatter (taller, colspan=2), row 2 =
+    silhouette + WCSS K-selection curves side by side."""
+    if "tsne_and_k" in _CLUSTERING_FIG_CACHE:
+        return _CLUSTERING_FIG_CACHE["tsne_and_k"]
+    from plotly.subplots import make_subplots                     # noqa: E402
+
+    cache    = _load_clustering_cache()
+    K_chosen = cache["K"]
+    xy, labels = _compute_or_load_tsne_large()
+
+    metrics = cache["fit"]["metrics"]
+    Ks   = sorted(metrics["silhouette"])
+    sil  = [metrics["silhouette"][k] for k in Ks]
+    wcss = [metrics["wcss"][k] for k in Ks]
+
+    # 4-col grid: t-SNE centred in cols 2-3 (60 % width), silhouette in
+    # row 2 cols 1-2 (50 %), WCSS in row 2 cols 3-4 (50 %) — both
+    # K-selection panels span their respective half of the slide.
+    fig = make_subplots(
+        rows=2, cols=4,
+        column_widths=[0.20, 0.30, 0.30, 0.20],
+        row_heights=[0.72, 0.28],
+        vertical_spacing=0.13, horizontal_spacing=0.10,
+        specs=[
+            [None, {"colspan": 2}, None, None],
+            [{"colspan": 2}, None, {"colspan": 2}, None],
+        ],
+        subplot_titles=(
+            "",                      # t-SNE: empty — title goes in slide H2
+            "Silhouette ↑",
+            "WCSS / inertia ↓ (elbow)",
+        ),
+    )
+
+    # Row 1: t-SNE scatter — one trace per cluster id.
+    for c in range(K_chosen):
+        mask = labels == c
+        if not mask.any():
+            continue
+        color = _CLUSTER_PALETTE[c % len(_CLUSTER_PALETTE)]
+        fig.add_trace(go.Scattergl(
+            x=xy[mask, 0], y=xy[mask, 1], mode="markers",
+            marker=dict(size=4.5, color=color, opacity=0.6,
+                         line=dict(width=0)),
+            name=f"C{c+1} (n={int(mask.sum()):,})",
+            hovertemplate=(f"C{c+1}<br>tsne1=%{{x:.2f}} "
+                           "tsne2=%{y:.2f}<extra></extra>"),
+            legendgroup=f"C{c+1}",
+        ), row=1, col=2)
+    fig.update_xaxes(title_text="t-SNE 1", row=1, col=2,
+                     showline=True, linewidth=1.0,
+                     linecolor="rgba(0,0,0,0.45)",
+                     mirror=True, ticks="outside",
+                     showgrid=False, zeroline=False)
+    # Lock aspect ratio so the t-SNE map renders as a square — sklearn's
+    # output isn't isotropic by default and wide aspect ratios stretch
+    # cluster shapes.
+    fig.update_yaxes(title_text="t-SNE 2", row=1, col=2,
+                     scaleanchor="x", scaleratio=1.0,
+                     showline=True, linewidth=1.0,
+                     linecolor="rgba(0,0,0,0.45)",
+                     mirror=True, ticks="outside",
+                     showgrid=False, zeroline=False)
+
+    # Row 2: silhouette spans cols 1-2 (50 % width), WCSS spans cols 3-4.
+    fig.add_trace(go.Scatter(
+        x=Ks, y=sil, mode="lines+markers",
+        line=dict(color="#1f77b4", width=2),
+        marker=dict(size=7),
+        hovertemplate="K=%{x}<br>silhouette=%{y:.4f}<extra></extra>",
+        showlegend=False,
+    ), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=Ks, y=wcss, mode="lines+markers",
+        line=dict(color="#9467bd", width=2),
+        marker=dict(size=7),
+        hovertemplate="K=%{x}<br>WCSS=%{y:,.0f}<extra></extra>",
+        showlegend=False,
+    ), row=2, col=3)
+    for col in (1, 3):
+        fig.add_vline(x=K_chosen, row=2, col=col,
+                      line=dict(color="#d62728", width=1.0, dash="dash"),
+                      annotation_text=f"K = {K_chosen}",
+                      annotation_position="top right",
+                      annotation_font=dict(size=10, color="#d62728"))
+        fig.update_xaxes(title_text="K", row=2, col=col,
+                         showline=True, linewidth=1.0,
+                         linecolor="rgba(0,0,0,0.45)",
+                         mirror=True, ticks="outside")
+    fig.update_yaxes(title_text="silhouette", row=2, col=1,
+                     showline=True, linewidth=1.0,
+                     linecolor="rgba(0,0,0,0.45)",
+                     mirror=True, ticks="outside")
+    fig.update_yaxes(title_text="WCSS", row=2, col=3,
+                     showline=True, linewidth=1.0,
+                     linecolor="rgba(0,0,0,0.45)",
+                     mirror=True, ticks="outside")
+
+    fig.update_layout(
+        template="plotly_white", autosize=True, height=920,
+        margin=dict(l=70, r=30, t=80, b=50),
+        font=dict(size=12, color="#222"),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="center", x=0.5, font=dict(size=11),
+        ),
+    )
+    _CLUSTERING_FIG_CACHE["tsne_and_k"] = fig
+    return fig
+
+
+def _load_centroid_aggs():
+    """Common loader for the cluster-aggregate figures."""
+    import pickle
+    import tx_clustering as txc                                    # noqa: E402
+    cache = _load_clustering_cache()
+    aggs  = cache["aggs"]
+    K     = int(aggs["K"])
+    with open(_ROOT / "data" / "clustering_cache" / "aggregate_meta.pkl", "rb") as f:
+        meta = pickle.load(f)
+    return cache, aggs, K, txc, int(meta["min_hour"])
+
+
+def fig_clustering_overview() -> go.Figure:
+    """Slide-9 overview: cluster sizes (left) + volume-weighted resource
+    composition per cluster (right, stacked horizontal bar).  Two panels
+    side-by-side; nothing else competes for vertical space."""
+    if "overview" in _CLUSTERING_FIG_CACHE:
+        return _CLUSTERING_FIG_CACHE["overview"]
+    from plotly.subplots import make_subplots                     # noqa: E402
+
+    cache, aggs, K, txc, _ = _load_centroid_aggs()
+    n_txs = aggs["n_txs"].astype(np.int64)
+    vol_full = aggs["vol_sum"].astype(np.float64)
+    keep  = vol_full.sum(axis=0) > 0
+    vol   = vol_full[:, keep]
+    res_keys   = [r for r, k in zip(txc.RESOURCES, keep) if k]
+    res_labels = [txc.RESOURCE_LABEL[r] for r in res_keys]
+    res_colors = [txc.RESOURCE_COLOR[lab] for lab in res_labels]
+    comp = vol / vol.sum(axis=1, keepdims=True)
+
+    # Cluster names are kept short ("c0", "c1", ...) on the axes; the full
+    # workload tag is shown in the description cards below the figure.
+    cluster_names  = [f"C{c+1}" for c in range(K)]
+    cluster_colors = [_CLUSTER_PALETTE[c] for c in range(K)]
+    sizes_pct = (n_txs / max(int(n_txs.sum()), 1)) * 100.0
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        column_widths=[0.30, 0.70],
+        horizontal_spacing=0.10,
+        subplot_titles=(
+            "Cluster size (% of all transactions)",
+            "Resource composition per cluster (volume-weighted)",
+        ),
+    )
+
+    fig.add_trace(go.Bar(
+        x=cluster_names, y=sizes_pct,
+        marker_color=cluster_colors,
+        text=[f"{p:.1f}%" for p in sizes_pct],
+        textposition="inside", insidetextanchor="middle",
+        textfont=dict(color="#fff", size=12),
+        showlegend=False,
+        hovertemplate="%{x}<br>size = %{y:.1f}% of txs<extra></extra>",
+    ), row=1, col=1)
+    fig.update_yaxes(title_text="% of txs", row=1, col=1,
+                     ticksuffix="%", rangemode="tozero",
+                     showline=True, linewidth=1.0,
+                     linecolor="rgba(0,0,0,0.45)",
+                     mirror=True, ticks="outside")
+    fig.update_xaxes(row=1, col=1,
+                     showline=True, linewidth=1.0,
+                     linecolor="rgba(0,0,0,0.45)",
+                     mirror=True, ticks="outside")
+
+    cum_x = np.zeros(K)
+    for r_idx, (lab, color) in enumerate(zip(res_labels, res_colors)):
+        seg_pct = comp[:, r_idx] * 100.0
+        # Only show the in-bar label when the segment is wide enough to
+        # fit "12.3%" cleanly; smaller segments get an empty string so
+        # they don't crowd the chart.
+        seg_text = [f"{p:.0f}%" if p >= 6.0 else "" for p in seg_pct]
+        fig.add_trace(go.Bar(
+            x=seg_pct, y=cluster_names,
+            base=cum_x.copy(),
+            orientation="h", name=lab, marker_color=color,
+            text=seg_text, textposition="inside",
+            insidetextanchor="middle",
+            textfont=dict(color="#fff", size=11),
+            hovertemplate=(f"%{{y}}<br>{lab}: " "%{x:.1f}%<extra></extra>"),
+        ), row=1, col=2)
+        cum_x = cum_x + seg_pct
+    fig.update_xaxes(range=[0, 100], row=1, col=2, ticksuffix="%",
+                     showline=True, linewidth=1.0,
+                     linecolor="rgba(0,0,0,0.45)",
+                     mirror=True, ticks="outside")
+    fig.update_yaxes(autorange="reversed", row=1, col=2,
+                     showline=True, linewidth=1.0,
+                     linecolor="rgba(0,0,0,0.45)",
+                     mirror=True, ticks="outside")
+
+    fig.update_layout(
+        template="plotly_white", autosize=True, height=340,
+        barmode="overlay",
+        margin=dict(l=70, r=30, t=60, b=40),
+        font=dict(size=11, color="#222"),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="center", x=0.5, font=dict(size=10),
+        ),
+    )
+    _CLUSTERING_FIG_CACHE["overview"] = fig
+    return fig
+
+
+def _cluster_descriptions_html(*, compact: bool = False) -> str:
+    """One-card-per-cluster description block.  Shows size, spam %,
+    workload tag (top two resources by volume share).  The `compact`
+    variant uses tighter padding + smaller font so the cards work as
+    a header strip on a slide that already has a big figure."""
+    cache, aggs, K, txc, _ = _load_centroid_aggs()
+    n_txs = aggs["n_txs"].astype(np.int64)
+    vol   = aggs["vol_sum"].astype(np.float64)
+    spam  = aggs["n_spam_label"].astype(np.float64)
+    n_total = max(int(n_txs.sum()), 1)
+
+    full_comp = vol / np.where(vol.sum(axis=1, keepdims=True) > 0,
+                                vol.sum(axis=1, keepdims=True), 1.0)
+    cards: list[str] = []
+    for c in range(K):
+        size_pct = (int(n_txs[c]) / n_total) * 100.0
+        sl = spam[c]
+        n_spam_total = float(sl[txc.SPAM_CODE[txc.SPAM_VOL]]
+                              + sl[txc.SPAM_CODE[txc.SPAM_REV]]
+                              + sl[txc.SPAM_CODE[txc.SPAM_BOTH]])
+        spam_pct = (n_spam_total / max(int(n_txs[c]), 1)) * 100.0
+        tag = txc.label_cluster(full_comp[c])
+        color = _CLUSTER_PALETTE[c]
+        cards.append(
+            '<div class="cluster-card">'
+            f'  <div class="cluster-card-tag" style="background:{color}">'
+            f'    C{c+1}'
+            '  </div>'
+            '  <div class="cluster-card-body">'
+            f'    <div class="cluster-card-line1">{tag}</div>'
+            f'    <div class="cluster-card-line2">'
+            f'      {size_pct:.1f}% of txs · {spam_pct:.1f}% spam · '
+            f'      {int(n_txs[c]):,} txs'
+            '    </div>'
+            '  </div>'
+            '</div>'
+        )
+    grid_class = (
+        "cluster-card-grid cluster-card-grid--compact"
+        if compact else "cluster-card-grid"
+    )
+    return f'<div class="{grid_class}">' + "".join(cards) + '</div>'
+
+
+def fig_clustering_per_cluster() -> go.Figure:
+    """Slide-9 per-cluster details: K rows × 3 cols.  Wider hourly chart
+    on the left, narrower median + spam on the right.  Cols are aligned
+    across rows so the eye can scan vertically.
+        col 1 : hourly resource-share stacked bar (% over time)
+        col 2 : median per-tx resource share (vertical bars)
+        col 3 : spam classification (Non-spam | High vol | High rev | Both)
+    """
+    if "per_cluster" in _CLUSTERING_FIG_CACHE:
+        return _CLUSTERING_FIG_CACHE["per_cluster"]
+    from plotly.subplots import make_subplots                     # noqa: E402
+
+    cache, aggs, K, txc, min_hour = _load_centroid_aggs()
+    hourly_gas    = aggs["hourly_gas"]
+    share_hist    = aggs["share_hist"]
+    n_txs         = aggs["n_txs"].astype(np.int64)
+    n_spam_label  = aggs["n_spam_label"].astype(np.int64)
+
+    any_gas = (hourly_gas.sum(axis=(0, 2)) > 0)
+    hour_indices = np.nonzero(any_gas)[0]
+    hour_dt = (
+        ((min_hour + hour_indices).astype(np.int64) * 3600)
+        .astype("datetime64[s]")
+    )
+
+    def _median_share(c: int, k: int) -> float:
+        counts = share_hist[c, :, k]
+        total  = counts.sum()
+        if total == 0:
+            return 0.0
+        cum = np.cumsum(counts)
+        b = int(np.searchsorted(cum, total / 2.0))
+        return 0.5 * (txc.SHARE_EDGES[b]
+                       + txc.SHARE_EDGES[min(b + 1, txc.N_SHARE_BINS)])
+
+    titles: list[str] = []
+    for c in range(K):
+        n = int(n_txs[c])
+        size_pct = (n / max(int(n_txs.sum()), 1)) * 100.0
+        titles.append(
+            f"<b>C{c+1}</b>  ·  {size_pct:.1f}% · "
+            f"{n:,} txs"
+        )
+        titles += ["", ""]
+
+    fig = make_subplots(
+        rows=K, cols=3,
+        column_widths=[0.62, 0.20, 0.18],
+        horizontal_spacing=0.05,
+        vertical_spacing=0.10,
+        subplot_titles=titles,
+    )
+
+    legend_ts: set[str] = set()
+    legend_spam: set[str] = set()
+
+    for c in range(K):
+        row = c + 1
+
+        # Col 1 — hourly resource-share stacked bar.
+        cluster_gas = hourly_gas[c, hour_indices, :]
+        row_total = cluster_gas.sum(axis=1).clip(min=1.0)
+        shares = cluster_gas / row_total[:, None]
+        cum = np.zeros(len(hour_indices))
+        for k, r in enumerate(txc.RESOURCES):
+            lab   = txc.RESOURCE_LABEL[r]
+            color = txc.RESOURCE_COLOR[lab]
+            y_pct = shares[:, k] * 100.0
+            show  = lab not in legend_ts
+            if show:
+                legend_ts.add(lab)
+            fig.add_trace(go.Bar(
+                x=hour_dt, y=y_pct, base=cum,
+                name=lab, marker_color=color, marker_line_width=0,
+                legendgroup="resource",
+                legendgrouptitle_text=("Hourly resource share"
+                                       if show else None),
+                showlegend=show,
+                hovertemplate=(f"{lab}: " "%{y:.1f}%<br>"
+                                "%{x|%Y-%m-%d %H:00}<extra></extra>"),
+            ), row=row, col=1)
+            cum = cum + y_pct
+        fig.update_yaxes(title_text=("% share" if c == 0 else ""),
+                         range=[0, 100], row=row, col=1)
+
+        # Col 2 — median per-tx resource share (vertical bar).
+        meds_pct = [_median_share(c, k) * 100.0
+                    for k in range(len(txc.RESOURCES))]
+        labels_x = [txc.RESOURCE_LABEL[r] for r in txc.RESOURCES]
+        colors_x = [txc.RESOURCE_COLOR[lab] for lab in labels_x]
+        fig.add_trace(go.Bar(
+            x=labels_x, y=meds_pct,
+            marker_color=colors_x, showlegend=False,
+            hovertemplate="%{x}<br>median = %{y:.1f}%<extra></extra>",
+        ), row=row, col=2)
+        fig.update_yaxes(title_text=("median %" if c == 0 else ""),
+                         range=[0, 100], row=row, col=2)
+        fig.update_xaxes(tickangle=-30, row=row, col=2)
+
+        # Col 3 — spam classification stacked by signal.
+        if int(n_txs[c]) > 0:
+            sl = n_spam_label[c]
+            n_non  = int(sl[txc.SPAM_CODE[txc.SPAM_NOT]]
+                          + sl[txc.SPAM_CODE[txc.SPAM_UNKNOWN]])
+            n_vol  = int(sl[txc.SPAM_CODE[txc.SPAM_VOL]])
+            n_rev  = int(sl[txc.SPAM_CODE[txc.SPAM_REV]])
+            n_both = int(sl[txc.SPAM_CODE[txc.SPAM_BOTH]])
+            denom = max(n_non + n_vol + n_rev + n_both, 1)
+            pct_non  = 100.0 * n_non  / denom
+            pct_vol  = 100.0 * n_vol  / denom
+            pct_rev  = 100.0 * n_rev  / denom
+            pct_both = 100.0 * n_both / denom
+
+            non_show = "Non-spam" not in legend_spam
+            if non_show:
+                legend_spam.add("Non-spam")
+            fig.add_trace(go.Bar(
+                x=["Non-spam"], y=[pct_non], name="Non-spam",
+                marker_color=txc.SPAM_COLOR[txc.SPAM_NOT],
+                legendgroup="spam_class",
+                legendgrouptitle_text=("Spam classification"
+                                       if non_show else None),
+                showlegend=non_show,
+                hovertemplate="Non-spam: %{y:.1f}%<extra></extra>",
+            ), row=row, col=3)
+
+            base = 0.0
+            for seg_label, val, color in [
+                ("High volume", pct_vol,  txc.SPAM_COLOR[txc.SPAM_VOL]),
+                ("High revert", pct_rev,  txc.SPAM_COLOR[txc.SPAM_REV]),
+                ("Both",        pct_both, txc.SPAM_COLOR[txc.SPAM_BOTH]),
+            ]:
+                seg_show = seg_label not in legend_spam
+                if seg_show:
+                    legend_spam.add(seg_label)
+                fig.add_trace(go.Bar(
+                    x=["Spam"], y=[val], base=base,
+                    name=seg_label, marker_color=color,
+                    legendgroup="spam_class",
+                    showlegend=seg_show,
+                    hovertemplate=(f"Spam, {seg_label}: "
+                                    "%{y:.1f}%<extra></extra>"),
+                ), row=row, col=3)
+                base += val
+        fig.update_yaxes(title_text=("% of cluster" if c == 0 else ""),
+                         range=[0, 100], row=row, col=3)
+
+    fig.update_xaxes(showline=True, linewidth=1.0,
+                      linecolor="rgba(0,0,0,0.45)",
+                      mirror=True, ticks="outside")
+    fig.update_yaxes(showline=True, linewidth=1.0,
+                      linecolor="rgba(0,0,0,0.45)",
+                      mirror=True, ticks="outside")
+    fig.update_layout(
+        template="plotly_white", autosize=True,
+        height=280 * K + 120,
+        barmode="overlay",
+        margin=dict(l=80, r=240, t=60, b=60),
+        legend=dict(
+            orientation="v",
+            yanchor="top", y=1.0,
+            xanchor="left", x=1.02,
+            groupclick="togglegroup",
+            bgcolor="rgba(255,255,255,0.97)",
+            bordercolor="rgba(0,0,0,0.20)", borderwidth=1,
+            font=dict(size=10),
+        ),
+        font=dict(size=11, color="#222"),
+        hovermode="x",
+    )
+    _CLUSTERING_FIG_CACHE["per_cluster"] = fig
+    return fig
+
+
+def _render_simple_table(headers: list[str], rows: list[list[str]],
+                          *, num_classes: list[bool] | None = None) -> str:
+    """Tiny HTML table used for dataframe-style snapshots.  Numeric cells
+    get tabular figures + right alignment when `num_classes[col]` is True;
+    the matching header gets the same class so header and body align in
+    the same column."""
+    th_cells = []
+    for i, h in enumerate(headers):
+        cls = "num" if num_classes and num_classes[i] else ""
+        th_cells.append(f'<th class="{cls}">{h}</th>')
+    th = "".join(th_cells)
+    body = []
+    for r in rows:
+        cells = []
+        for i, c in enumerate(r):
+            cls = ("num" if num_classes and num_classes[i] else "")
+            cells.append(f'<td class="{cls}">{c}</td>')
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    return (
+        '<table class="snapshot-table">'
+        f'  <thead><tr>{th}</tr></thead>'
+        f'  <tbody>{"".join(body)}</tbody>'
+        '</table>'
+    )
+
+
+def _clustering_feature_snapshots() -> str:
+    """Two side-by-side dataframe heads: raw per-tx gas (sample.parquet)
+    and the CLR-transformed feature vectors (features.npz X_clr)."""
+    cache = _load_clustering_cache()
+    sample = cache["sample"].head(5)
+    X_clr  = cache["X_clr"][:5]
+
+    gas_cols = ["gas_c", "gas_sw", "gas_sr", "gas_sg",
+                "gas_hg", "gas_l2", "gas_l1"]
+    raw_rows = []
+    for i, r in enumerate(sample.iter_rows(named=True), 1):
+        cells = [f"tx {i}"]
+        cells += [f"{int(r[c]):,}" for c in gas_cols]
+        raw_rows.append(cells)
+    raw_table = _render_simple_table(
+        ["", "c", "sw", "sr", "sg", "hg", "l2", "l1"],
+        raw_rows,
+        num_classes=[False] + [True] * 7,
+    )
+
+    clr_rows = []
+    for i in range(X_clr.shape[0]):
+        cells = [f"tx {i+1}"]
+        cells += [f"{X_clr[i, j]:+.2f}" for j in range(X_clr.shape[1])]
+        clr_rows.append(cells)
+    clr_table = _render_simple_table(
+        ["", "c", "sw", "sr", "sg", "hg", "l2", "l1"],
+        clr_rows,
+        num_classes=[False] + [True] * 7,
+    )
+
+    return (
+        '<div class="snapshot-row">'
+        '  <div class="snapshot-block">'
+        '    <div class="snapshot-title">Raw per-tx gas (5 rows)</div>'
+        f'    {raw_table}'
+        '  </div>'
+        '  <div class="snapshot-block">'
+        '    <div class="snapshot-title">CLR features (same 5 rows)</div>'
+        f'    {clr_table}'
+        '  </div>'
+        '</div>'
+    )
+
+
+def _spam_data_preview() -> str:
+    """Head of wallet_spam_classification.parquet — what the per-tx
+    cluster aggregator joins on."""
+    df = pl.read_parquet(SPAM_PARQUET).head(5).select([
+        "address", "tx_count", "revert_count", "revert_ratio",
+        "n_days_active", "n_days_spam", "frac_spam_days",
+        "is_spam", "is_spam_ever",
+    ])
+    rows = []
+    for r in df.iter_rows(named=True):
+        addr = r["address"]
+        addr_short = addr[:6] + "…" + addr[-4:] if len(addr) > 12 else addr
+        rows.append([
+            addr_short,
+            f"{int(r['tx_count']):,}",
+            f"{int(r['revert_count']):,}",
+            f"{r['revert_ratio']:.4f}",
+            str(int(r['n_days_active'])),
+            str(int(r['n_days_spam'])),
+            f"{r['frac_spam_days']:.3f}",
+            "✓" if r['is_spam'] else "·",
+            "✓" if r['is_spam_ever'] else "·",
+        ])
+    table = _render_simple_table(
+        ["address", "tx_count", "rev_count", "rev_ratio",
+         "n_days_active", "n_days_spam", "frac_spam",
+         "is_spam", "is_spam_ever"],
+        rows,
+        num_classes=[False, True, True, True, True, True, True, False, False],
+    )
+    return (
+        '<div class="snapshot-row">'
+        '  <div class="snapshot-block snapshot-wide">'
+        '    <div class="snapshot-title">'
+        '      wallet_spam_classification.parquet (5 rows)'
+        '    </div>'
+        f'    {table}'
+        '  </div>'
+        '</div>'
+    )
+
+
+SPAM_PARQUET       = _ROOT / "data" / "wallet_spam_classification.parquet"
+DAILY_SPAM_PARQUET = _ROOT / "data" / "daily_spam_breakdown.parquet"
+
+
+def fig_daily_spam_share() -> go.Figure:
+    """Daily share of transactions, stacked into 4 segments:
+    non-spam, high-volume only, high-revert only, both.  Sourced
+    from the daily breakdown parquet (per-signal SQL added in
+    spam_insights.py)."""
+    if "daily_spam_share" in _CLUSTERING_FIG_CACHE:
+        return _CLUSTERING_FIG_CACHE["daily_spam_share"]
+
+    df = (
+        pl.read_parquet(DAILY_SPAM_PARQUET)
+          .filter(pl.col("day") >= datetime(2025, 10, 1))
+          .filter(pl.col("total_txs") > 0)
+          .sort("day")
+    )
+    days     = df["day"].to_list()
+    nonspam  = df["nonspammer_txs"].to_numpy().astype(np.float64)
+    vol_only = df["spammer_txs_vol_only"].to_numpy().astype(np.float64)
+    rev_only = df["spammer_txs_rev_only"].to_numpy().astype(np.float64)
+    both     = df["spammer_txs_both"].to_numpy().astype(np.float64)
+    total    = nonspam + vol_only + rev_only + both
+    safe     = np.where(total > 0, total, 1.0)
+    nonspam_pct  = nonspam  / safe * 100.0
+    vol_pct      = vol_only / safe * 100.0
+    rev_pct      = rev_only / safe * 100.0
+    both_pct     = both     / safe * 100.0
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=days, y=nonspam_pct, name="Non-spam",
+        marker_color="#2ca02c",
+        hovertemplate="%{x|%Y-%m-%d}<br>"
+                       "non-spam = %{y:.1f}% of daily txs<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        x=days, y=vol_pct, name="High volume",
+        marker_color="#ff7f0e",
+        hovertemplate="%{x|%Y-%m-%d}<br>"
+                       "high-vol = %{y:.1f}% of daily txs<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        x=days, y=rev_pct, name="High revert",
+        marker_color="#d62728",
+        hovertemplate="%{x|%Y-%m-%d}<br>"
+                       "high-rev = %{y:.1f}% of daily txs<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        x=days, y=both_pct, name="Both",
+        marker_color="#8c2d04",
+        hovertemplate="%{x|%Y-%m-%d}<br>"
+                       "both = %{y:.1f}% of daily txs<extra></extra>",
+    ))
+    fig.update_layout(
+        template="plotly_white", autosize=True, height=360,
+        barmode="stack", bargap=0.0,
+        margin=dict(l=70, r=30, t=10, b=40),
+        font=dict(size=11, color="#222"),
+        hovermode="x",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="center", x=0.5, font=dict(size=11),
+        ),
+    )
+    fig.update_yaxes(title_text="% of daily txs",
+                     range=[0, 100], ticksuffix="%",
+                     showline=True, linewidth=1.0,
+                     linecolor="rgba(0,0,0,0.45)",
+                     mirror=True, ticks="outside")
+    fig.update_xaxes(showline=True, linewidth=1.0,
+                      linecolor="rgba(0,0,0,0.45)",
+                      mirror=True, ticks="outside")
+    _CLUSTERING_FIG_CACHE["daily_spam_share"] = fig
+    return fig
+
+
+def _spam_summary_stats_html() -> str:
+    """Wallet-level stats card for the spam-flag slide.  Counts wallets
+    flagged in each spam class (volume-only / revert-only / both) using
+    the per-wallet rollup."""
+    df = pl.read_parquet(SPAM_PARQUET)
+    only_vol  = df.filter((pl.col("n_days_high_vol") > 0)
+                           & (pl.col("n_days_high_rev") == 0)
+                           & pl.col("is_spam_ever").cast(bool))
+    only_rev  = df.filter((pl.col("n_days_high_rev") > 0)
+                           & (pl.col("n_days_high_vol") == 0)
+                           & pl.col("is_spam_ever").cast(bool))
+    both      = df.filter((pl.col("n_days_high_vol") > 0)
+                           & (pl.col("n_days_high_rev") > 0))
+    not_spam  = df.filter(~pl.col("is_spam_ever").cast(bool))
+
+    def _txs(slc: pl.DataFrame) -> int:
+        return int(slc["tx_count"].sum())
+
+    rows = [
+        ("Volume only (top 0.1 %)", only_vol.height, _txs(only_vol),
+         "#ff7f0e"),
+        ("Revert only (≥30 % rev)", only_rev.height, _txs(only_rev),
+         "#d62728"),
+        ("Both signals",            both.height,     _txs(both),
+         "#8c2d04"),
+        ("Non-spam (any-day)",      not_spam.height, _txs(not_spam),
+         "#2ca02c"),
+    ]
+    body_rows = []
+    for label, n_w, n_tx, color in rows:
+        body_rows.append(
+            "<tr>"
+            f'<td><span class="spam-pill" '
+            f'style="background:{color}"></span>{label}</td>'
+            f'<td class="num">{n_w:,}</td>'
+            f'<td class="num">{n_tx:,}</td>'
+            "</tr>"
+        )
+    return (
+        '<div class="snapshot-row">'
+        '  <div class="snapshot-block">'
+        '    <div class="snapshot-title">'
+        '      Spam-wallet rollup (full window)'
+        '    </div>'
+        '    <table class="snapshot-table snapshot-table--text-first">'
+        '      <thead><tr>'
+        '        <th>category</th>'
+        '        <th class="num">wallets</th>'
+        '        <th class="num">tx_count</th>'
+        '      </tr></thead>'
+        f'    <tbody>{"".join(body_rows)}</tbody>'
+        '    </table>'
+        '  </div>'
+        '</div>'
+    )
+
+
+def clustering_slide_html() -> str:
+    """Top-level <section> for the per-tx clustering result. Vertical
+    sub-slides:
+        1. Methodology / steps + feature snapshots.
+        2. Spam-classification methodology + data head.
+        3. t-SNE scatter, K = 5 clusters.
+        4. K-selection diagnostics.
+        5. Cluster characteristics (size, composition, spam mix).
+    """
+    print("Loading clustering cache (slide 9)...")
+    t0 = time.time()
+    f_tsne_k   = fig_clustering_tsne_and_k()
+    f_overview = fig_clustering_overview()
+    f_per_c    = fig_clustering_per_cluster()
+    feat_snap  = _clustering_feature_snapshots()
+    spam_snap  = _spam_data_preview()
+    cluster_descriptions         = _cluster_descriptions_html()
+    cluster_descriptions_compact = _cluster_descriptions_html(compact=True)
+    print(f"  built clustering figures in {time.time()-t0:.2f}s")
+
+    clr_eq = (
+        r"\text{CLR}(x_k) = \ln \frac{x_k}{g(x)}"
+        r", \qquad "
+        r"g(x) = \left( x_1 \cdot x_2 \cdots x_D \right)^{1/D}"
+    )
+
+    intro_section = (
+        '<section class="chart-stats-slide cluster-intro">'
+        '  <h2>Per-tx clustering: workload regimes by gas mix</h2>'
+        '  <div class="cluster-method">'
+        '    <ol>'
+        '      <li><b>Features.</b> Centred-log-ratio (CLR) of per-tx '
+        '          gas usage across the 7 priced resources '
+        '          (compute, sw, sr, sg, hg, l2, l1). For each tx we '
+        '          divide every component by the <i>geometric mean</i> '
+        '          of all components, then take the natural log. Two '
+        '          txs with the same resource ratios land at the same '
+        '          point regardless of total gas, so clusters describe '
+        '          <i>what kind of work</i> a tx does, not how much.'
+        f'         <div class="method-eq">\\[{clr_eq}\\]</div>'
+        '      </li>'
+        '      <li><b>KMeans (mini-batch).</b> Streaming partial-fit '
+        '          over every priced tx in the multigas dataset '
+        '          (~416 M txs).</li>'
+        '      <li><b>K selection.</b> Target K ≈ number of priced '
+        '          resources (one cluster per dominant resource), '
+        '          and reject K values where two clusters end up '
+        '          looking near-identical. Silhouette ↑ and WCSS '
+        '          elbow ↓ are sanity checks; final pick is '
+        '          <b>K = 5</b>.</li>'
+        '      <li><b>Aggregate + visualise.</b> Per-cluster tx '
+        '          count, volume-weighted resource centroid, '
+        '          spam-label split, plus a 12 K-pt t-SNE map.</li>'
+        '    </ol>'
+        '  </div>'
+        f' {feat_snap}'
+        '</section>'
+    )
+    f_spam_share = fig_daily_spam_share()
+    spam_stats   = _spam_summary_stats_html()
+    dune_url = "https://dune.com/queries/5555110/9052858"
+    spam_intro_section = (
+        '<section class="chart-stats-slide cluster-intro">'
+        '  <h2>Spam wallets flag</h2>'
+        '  <div class="slide-note" '
+        '       style="text-align:left">'
+        '    Inspired by Entropy Advisors&rsquo; internal spam-flagging '
+        f'   query on Dune: <a href="{dune_url}" target="_blank" '
+        '    rel="noopener">'
+        '    dune.com/queries/5555110</a>. '
+        '    We deliberately stayed with this percentile + revert '
+        '    rule approach rather than a separate clustering pass: '
+        '    it already catches the vast majority of spam wallets '
+        '    and avoids stacking another model on top.'
+        '  </div>'
+        '  <div class="cluster-method">'
+        '    <ol>'
+        '      <li><b>Per (wallet, day)</b>: count txs and reverts.</li>'
+        '      <li><b>Top 0.01 % percentile cutoff</b> on per-wallet '
+        '          tx_count, recomputed each day.</li>'
+        '      <li><b>Two flags per day</b>: '
+        '          <code>high_vol</code> = '
+        '          <code>n_tx &gt; top 0.1 % percentile</code>; '
+        '          <code>high_rev</code> = '
+        '          <code>revert_ratio &ge; 30 %</code> AND '
+        '          <code>n_tx &ge; 50</code>. '
+        '          <code>is_spam_day = high_vol OR high_rev</code>.</li>'
+        '      <li><b>Wallet label</b>: '
+        '          <code>is_spam = (n_spam_days / n_active_days &ge; 0.5)</code>.</li>'
+        '    </ol>'
+        '  </div>'
+        f' {spam_snap}'
+        f' {spam_stats}'
+        '  <div class="snapshot-title" '
+        '       style="text-align:center; margin: 0.6em auto 0.2em;">'
+        '    Daily share of transactions: non-spam, high-volume, '
+        '    high-revert, both'
+        '  </div>'
+        f' <div class="hist-grid">{fig_div(f_spam_share, "fig-daily-spam-share")}</div>'
+        '</section>'
+    )
+    tsne_section = (
+        '<section class="chart-stats-slide">'
+        '  <h2>t-SNE map and K-selection diagnostics</h2>'
+        '  <div class="slide-note">'
+        '    t-SNE is a non-linear dimensionality reduction from the '
+        '    7-D CLR feature space to 2D, used purely to visualise '
+        '    cluster separation. <b>For the slide we run t-SNE on a '
+        f'   {TSNE_LARGE_N:,}-tx sub-sample</b> so it renders fast; '
+        '    the per-cluster figures on the next slides are computed '
+        '    on the <b>full 498 M-tx dataset</b>. Below the map, '
+        '    silhouette and WCSS confirm the choice of K = 5.'
+        '  </div>'
+        f' <div class="hist-grid">{fig_div(f_tsne_k, "fig-cluster-tsne-k")}</div>'
+        '</section>'
+    )
+    centroid_overview_section = (
+        '<section class="chart-stats-slide">'
+        '  <h2>Cluster characteristics: size and composition</h2>'
+        '  <div class="slide-note">'
+        '    Per-cluster size and volume-weighted resource '
+        '    composition. Aggregated over all 498 M priced txs '
+        '    in the dataset.'
+        '  </div>'
+        f' <div class="hist-grid">{fig_div(f_overview, "fig-cluster-overview")}</div>'
+        f' {cluster_descriptions}'
+        '</section>'
+    )
+    centroid_per_section = (
+        '<section class="chart-stats-slide">'
+        '  <h2>Per-cluster details: hourly share, median, spam</h2>'
+        f' {cluster_descriptions_compact}'
+        f' <div class="hist-grid">{fig_div(f_per_c, "fig-cluster-per")}</div>'
+        '</section>'
+    )
+    return (
+        '<section>\n'
+        f'  {intro_section}\n'
+        f'  {tsne_section}\n'
+        f'  {spam_intro_section}\n'
+        f'  {centroid_overview_section}\n'
+        f'  {centroid_per_section}\n'
         '</section>'
     )
 
@@ -1367,6 +3309,27 @@ def _total_txs() -> int:
     return sum(pq.ParquetFile(str(p)).metadata.num_rows for p in paths)
 
 
+def _total_wallets() -> int:
+    """Distinct sender count over the analysis window. Uses the
+    wallet_spam_classification.parquet rollup (one row per wallet that
+    sent ≥ 1 tx in the window) when available — that's a metadata-only
+    read, much cheaper than scanning per-tx senders."""
+    import pyarrow.parquet as pq
+    if SPAM_PARQUET.exists():
+        return pq.ParquetFile(str(SPAM_PARQUET)).metadata.num_rows
+    return 0
+
+
+def _multigas_extract_max_month() -> str | None:
+    """Latest YYYY-MM folder under data/multigas_usage_extracts that has
+    a per_tx.parquet — used to flag when the per-tx coverage trails the
+    per-block window.  Returns None if the directory is empty."""
+    base = _ROOT / "data" / "multigas_usage_extracts"
+    months = sorted(p.parent.name for p in base.glob("*/per_tx.parquet")
+                    if len(p.parent.name) == 7)
+    return months[-1] if months else None
+
+
 def stat_html(blocks_wide: pl.DataFrame, blocks: pl.DataFrame) -> str:
     date_min = blocks_wide["block_date"].min()
     date_max = blocks_wide["block_date"].max()
@@ -1374,6 +3337,19 @@ def stat_html(blocks_wide: pl.DataFrame, blocks: pl.DataFrame) -> str:
 
     n_blocks_full = blocks_wide.height
     n_txs         = _total_txs()
+    n_wallets     = _total_wallets()
+    mg_month_max  = _multigas_extract_max_month()
+    # Format the per-tx (multigas) coverage end as e.g. "2026-03-31".
+    mg_window_note = ""
+    if mg_month_max:
+        from calendar import monthrange
+        y, m = int(mg_month_max[:4]), int(mg_month_max[5:7])
+        mg_end = f"{y:04d}-{m:02d}-{monthrange(y, m)[1]:02d}"
+        if mg_end < str(date_max)[:10]:
+            mg_window_note = (
+                f' <span class="src-tag">per-tx extract: → {mg_end} '
+                'so far, full April catch-up pending</span>'
+            )
 
     # Total priced gas (Tgas) — 7 resources counted (incl L1 calldata,
     # which is tracked even though ArbOS 60 doesn't price it dynamically).
@@ -1393,10 +3369,11 @@ def stat_html(blocks_wide: pl.DataFrame, blocks: pl.DataFrame) -> str:
     )
 
     rows = [
-        ("Window",              f"{date_min} → {date_max}"),
+        ("Window",              f"{date_min} → {date_max}{mg_window_note}"),
         ("Days",                f"{n_days:,}"),
         ("Total blocks",        f"{n_blocks_full:,}"),
         ("Total transactions",  f"{n_txs:,}"),
+        ("Active wallets",      f"{n_wallets:,}"),
         ("Total gas",           f"{total_gas_tgas:,.2f} Tgas"),
         ("Resources tracked",
                                 f"7: {resource_names}"),
@@ -1449,7 +3426,7 @@ PAGE_TEMPLATE = """<!doctype html>
         skipHtmlTags: ['script', 'noscript', 'style', 'textarea',
                         'pre', 'code'],
         ignoreHtmlClass: 'tex2jax_ignore|reveal',
-        processHtmlClass: 'tex2jax_process|method-eq|spec-ineq|set-ineq',
+        processHtmlClass: 'tex2jax_process|method-eq|spec-ineq|set-ineq|methodology',
       }},
       svg: {{ fontCache: 'global' }},
     }};
@@ -1783,6 +3760,244 @@ PAGE_TEMPLATE = """<!doctype html>
       max-width: 360px;
     }}
 
+    /* Dataframe-style snapshot tables on the cluster + spam intro slides. */
+    .snapshot-row {{
+      display: flex; flex-wrap: wrap; gap: 1.2em;
+      justify-content: center; align-items: flex-start;
+      max-width: 1300px; margin: 0.6em auto 0;
+    }}
+    .snapshot-block {{ flex: 1 1 540px; min-width: 460px; }}
+    .snapshot-block.snapshot-wide {{ flex: 1 1 1100px; }}
+    .snapshot-title {{
+      font-size: 0.5em; font-weight: 600; color: #444;
+      letter-spacing: 0.04em; text-transform: uppercase;
+      margin: 0 0 0.3em 0.1em;
+    }}
+    table.snapshot-table {{
+      border-collapse: collapse;
+      font-size: 0.5em; color: #111;
+      width: 100%;
+      table-layout: fixed;
+    }}
+    table.snapshot-table th, table.snapshot-table td {{
+      padding: 0.3em 0.6em;
+      border-bottom: 1px solid #e0e0e0;
+      text-align: left; font-weight: 400;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }}
+    table.snapshot-table thead th {{
+      background: #f4f4f4; font-weight: 600;
+      border-bottom: 2px solid #333; color: #111;
+    }}
+    table.snapshot-table td.num, table.snapshot-table th.num {{
+      text-align: right; font-variant-numeric: tabular-nums;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    }}
+    /* Coloured pill chip used in the spam summary stats card. */
+    .spam-pill {{
+      display: inline-block; width: 9px; height: 9px;
+      margin-right: 7px; vertical-align: middle;
+      border-radius: 2px;
+    }}
+
+    /* Cluster description card grid (size + composition slide). */
+    .cluster-card-grid {{
+      display: flex; flex-wrap: wrap; gap: 0.6em;
+      justify-content: center; margin: 0.5em auto 0;
+      max-width: 1300px;
+    }}
+    .cluster-card {{
+      display: flex; align-items: center;
+      flex: 1 1 240px; min-width: 240px; max-width: 280px;
+      background: #fafafa; border: 1px solid #e0e0e0;
+      border-radius: 4px; padding: 0.45em 0.6em;
+    }}
+    .cluster-card-tag {{
+      display: inline-block;
+      width: 2.6em; min-width: 2.6em;
+      padding: 0.25em 0;
+      margin-right: 0.7em;
+      color: #fff; font-weight: 700;
+      text-align: center; border-radius: 3px;
+      font-size: 0.62em;
+    }}
+    .cluster-card-body {{
+      flex: 1; line-height: 1.35; min-width: 0;
+    }}
+    .cluster-card-line1 {{
+      font-size: 0.5em; font-weight: 600; color: #111;
+    }}
+    .cluster-card-line2 {{
+      font-size: 0.45em; color: #555; margin-top: 1px;
+      font-variant-numeric: tabular-nums;
+    }}
+
+    /* Compact variant: header strip on the per-cluster details slide. */
+    .cluster-card-grid--compact {{
+      gap: 0.4em; margin: 0.2em auto 0.4em;
+    }}
+    .cluster-card-grid--compact .cluster-card {{
+      flex: 1 1 200px; min-width: 200px; max-width: 250px;
+      padding: 0.3em 0.45em;
+    }}
+    .cluster-card-grid--compact .cluster-card-tag {{
+      width: 2.0em; min-width: 2.0em;
+      padding: 0.18em 0;
+      margin-right: 0.5em;
+      font-size: 0.5em;
+    }}
+    .cluster-card-grid--compact .cluster-card-line1 {{
+      font-size: 0.4em;
+    }}
+    .cluster-card-grid--compact .cluster-card-line2 {{
+      font-size: 0.36em;
+    }}
+    /* First column is the tx-row label ("tx 1"…); fix it narrow so the
+       7 numeric columns get equal share. */
+    table.snapshot-table th:first-child,
+    table.snapshot-table td:first-child {{
+      width: 4em; color: #777;
+    }}
+    /* Override for tables whose first column is a free-form text label
+       (e.g. the spam summary card) — let the column auto-size and wrap. */
+    table.snapshot-table--text-first {{
+      table-layout: auto;
+    }}
+    table.snapshot-table--text-first th:first-child,
+    table.snapshot-table--text-first td:first-child {{
+      width: auto; min-width: 16em; color: #111;
+      white-space: normal;
+    }}
+
+    /* Per-tx clustering methodology slide. */
+    .cluster-intro .cluster-method {{
+      background: #fafafa; border: 1px solid #e0e0e0; border-radius: 4px;
+      padding: 0.7em 1.3em; max-width: 1100px;
+      margin: 0.4em auto 0.5em;
+      font-size: 0.6em; color: #333; line-height: 1.55;
+    }}
+    .cluster-intro .cluster-method ol {{
+      padding-left: 1.4em; margin: 0.2em 0;
+    }}
+    .cluster-intro .cluster-method li {{ margin: 0.4em 0; }}
+    .cluster-intro .cluster-method b {{ color: #08519c; }}
+    .cluster-intro .cluster-method code {{
+      background: rgba(0,0,0,0.05); padding: 1px 4px;
+      border-radius: 2px; font-size: 0.95em;
+    }}
+    .cluster-intro .cluster-method ul.cluster-method-rules {{
+      margin: 0.3em 0 0.3em 0.4em; padding-left: 1.1em;
+      list-style: disc; color: #444;
+    }}
+    .cluster-intro .cluster-method ul.cluster-method-rules li {{
+      margin: 0.18em 0;
+    }}
+    /* Display equations inside cluster-method need a fudge factor so
+       MathJax doesn't inherit the small list font size. */
+    .cluster-intro .cluster-method .method-eq {{
+      margin: 0.5em 0 0.3em;
+    }}
+    .cluster-intro .cluster-method .method-eq mjx-container[display="true"] {{
+      font-size: 1.45em !important;
+      margin: 0.2em 0 !important;
+    }}
+
+    /* Capacity-headroom methodology slide. */
+    .capacity-intro .capacity-definition {{
+      background: rgba(31, 119, 180, 0.06);
+      border-left: 3px solid #1f77b4;
+      padding: 0.7em 1.1em; max-width: 1100px;
+      margin: 0.4em auto 0.6em;
+      font-size: 0.62em; color: #333; line-height: 1.55;
+    }}
+    .capacity-intro .capacity-definition .who {{
+      font-weight: 600; color: #08519c;
+      font-size: 0.92em; margin-bottom: 0.3em;
+    }}
+    .capacity-intro .methodology {{
+      background: #fafafa; border: 1px solid #e0e0e0; border-radius: 4px;
+      padding: 0.8em 1.4em; max-width: 1100px;
+      margin: 0.4em auto 0.5em;
+      font-size: 0.62em; color: #333; line-height: 1.55;
+    }}
+    .capacity-intro .methodology ol {{
+      padding-left: 1.4em; margin: 0.2em 0;
+    }}
+    .capacity-intro .methodology li {{ margin: 0.5em 0; }}
+    .capacity-intro .methodology code {{
+      background: rgba(0,0,0,0.05); padding: 1px 4px;
+      border-radius: 2px; font-size: 0.95em;
+    }}
+    /* Display equations inside the methodology block: scale to match
+       the surrounding text and avoid the giant default MathJax size. */
+    .capacity-intro .methodology .method-eq {{
+      margin: 0.4em 0 0.2em;
+    }}
+    .capacity-intro .methodology .method-eq mjx-container[display="true"] {{
+      font-size: 1.6em !important;
+      margin: 0.3em 0 !important;
+    }}
+
+    /* Short data + interpretation note above/below figures. */
+    .slide-note {{
+      max-width: 1200px; margin: 0.4em auto 0.6em;
+      padding: 0.6em 1em;
+      font-size: 0.62em; color: #333; line-height: 1.55;
+      background: rgba(31, 119, 180, 0.05);
+      border-left: 3px solid #1f77b4;
+      border-radius: 2px;
+    }}
+    .slide-note b {{ color: #08519c; font-weight: 600; }}
+
+    /* Side-by-side summary tables on the revenue summary slide. */
+    .revenue-tables {{
+      display: flex; flex-wrap: wrap; gap: 1.5em;
+      justify-content: center; margin: 0.5em auto 0;
+      max-width: 1300px;
+    }}
+    .revenue-tables .rev-table-block {{
+      flex: 1 1 540px; min-width: 480px;
+    }}
+    .revenue-tables .rev-table-block h3 {{
+      font-size: 0.6em; color: #444; font-weight: 600;
+      margin: 0 0 0.4em 0;
+    }}
+    .revenue-tables table {{
+      font-size: 0.6em !important;
+    }}
+
+    /* Revenue-comparison intro slide: two side-by-side cards. */
+    .intro-revenue {{
+      display: flex; flex-direction: column;
+    }}
+    .intro-revenue h2 {{ margin-bottom: 0.5em; }}
+    .intro-revenue .intro-card {{
+      max-width: 1100px; margin: 0.4em auto;
+      padding: 0.8em 1.2em;
+      background: #fafafa;
+      border: 1px solid #e0e0e0; border-left: 3px solid #1f77b4;
+      border-radius: 4px;
+      font-size: 0.62em; color: #333; line-height: 1.55;
+    }}
+    .intro-revenue .intro-card-tag {{
+      font-weight: 600; color: #08519c;
+      font-size: 0.92em; margin-bottom: 0.4em;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }}
+    .intro-revenue .intro-card p {{
+      margin: 0 0 0.6em 0;
+    }}
+    .intro-revenue .intro-card p:last-child {{
+      margin-bottom: 0;
+    }}
+    .intro-revenue .intro-points {{
+      margin: 0.2em 0 0 1.1em; padding-left: 0;
+    }}
+    .intro-revenue .intro-points li {{
+      margin: 0.3em 0;
+    }}
+    .intro-revenue .intro-points b {{ color: #08519c; }}
+
     /* Slide 8 — short Taylor-4 explainer above the comparison chart. */
     .taylor-note {{
       font-size: 0.6em; color: #444; line-height: 1.5;
@@ -2102,6 +4317,15 @@ PAGE_TEMPLATE = """<!doctype html>
     <!-- Slide 6: ArbOS 60 + ArbOS 51 implementations (vertical group) -->
     {SLIDE6}
 
+    <!-- Slide 7: ArbOS 60 vs 51 revenue (no demand elasticity) -->
+    {SLIDE7}
+
+    <!-- Slide 8: ArbOS 60 capacity headroom -->
+    {SLIDE8}
+
+    <!-- Slide 9: per-tx clustering (CLR + KMeans) -->
+    {SLIDE9}
+
   </div>
 </div>
 
@@ -2118,25 +4342,53 @@ PAGE_TEMPLATE = """<!doctype html>
     transition: 'fade',
   }});
 
-  // Reveal hides slides until they are active; plotly measures 0×0 on
-  // initial render and needs a resize once a slide becomes visible.
-  // Two-step resize handles the race where the first call lands before
-  // the slide-transition transform has finished.
+  // Reveal hides slides until they are active; Plotly measures 0×0 on
+  // initial render and needs a resize once a slide becomes visible. The
+  // resize must run after Reveal has finished its CSS transform AND
+  // Plotly has had a chance to lay out (its own internal layout is
+  // async). One delayed call doesn't always cover both — schedule a
+  // burst of retries at 0/80/200/450/900 ms so even a slow first render
+  // catches up. Each Plotly.Plots.resize is idempotent and cheap when
+  // already at the right size, so the burst is safe.
+  const RESIZE_DELAYS_MS = [0, 80, 200, 450, 900];
   function resizeVisiblePlots() {{
     document.querySelectorAll('.plotly-graph-div').forEach(el => {{
-      if (el.offsetParent !== null) Plotly.Plots.resize(el);
+      if (el.offsetParent === null) return;          // not on screen
+      const r = el.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) return;       // not laid out yet
+      try {{ Plotly.Plots.resize(el); }} catch (e) {{}}
     }});
   }}
-  Reveal.on('ready slidechanged', () => {{
-    resizeVisiblePlots();
-    setTimeout(resizeVisiblePlots, 250);
-    // Re-typeset MathJax for the active slide so equations show even if
-    // the slide was hidden when MathJax first loaded.
+  function scheduleResizeBurst() {{
+    RESIZE_DELAYS_MS.forEach(d => setTimeout(resizeVisiblePlots, d));
+  }}
+  // Reveal fires `slidechanged` once the new slide is current — but the
+  // CSS slide-transition is still running.  `slidetransitionend` fires
+  // when it lands, which is when the plot containers actually have
+  // their final size.  Listening to both covers fast-jump (no
+  // transition) AND animated transitions.
+  Reveal.on('ready slidechanged slidetransitionend', () => {{
+    scheduleResizeBurst();
     if (window.MathJax && window.MathJax.typesetPromise) {{
       window.MathJax.typesetPromise();
     }}
   }});
-  window.addEventListener('resize', () => setTimeout(resizeVisiblePlots, 50));
+  window.addEventListener('resize', scheduleResizeBurst);
+  // Final safety net: any plot that ends up with the wrong size after
+  // the burst will be picked up the moment its container size changes
+  // (eg. when a sibling vertical sub-slide finishes its transform).
+  if (typeof ResizeObserver !== 'undefined') {{
+    const ro = new ResizeObserver(entries => {{
+      for (const e of entries) {{
+        if (e.target.offsetParent === null) continue;
+        const r = e.contentRect;
+        if (r.width >= 8 && r.height >= 8) {{
+          try {{ Plotly.Plots.resize(e.target); }} catch (err) {{}}
+        }}
+      }}
+    }});
+    document.querySelectorAll('.plotly-graph-div').forEach(el => ro.observe(el));
+  }}
 </script>
 </body>
 </html>
@@ -2183,6 +4435,9 @@ def main() -> None:
         # safe — both copies render independently.
         STATS_TABLE_2=stats_table,
         SLIDE6=arbos60_code_slide_html(),
+        SLIDE7=revenue_no_elasticity_slide_html(),
+        SLIDE8=capacity_slide_html(),
+        SLIDE9=clustering_slide_html(),
     )
     OUT_HTML.write_text(page)
     print(f"Saved {OUT_HTML} ({OUT_HTML.stat().st_size / 1024:.1f} KB)")

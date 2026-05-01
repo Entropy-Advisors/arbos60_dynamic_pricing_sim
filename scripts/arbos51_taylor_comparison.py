@@ -285,7 +285,7 @@ def main() -> None:
         column_widths=[1.0 / n_panels] * n_panels,
         row_heights=[0.18, 0.24, 0.16, 0.42],
         subplot_titles=(
-            "exp vs Taylor  (E ∈ [0, 8], log y)",
+            "Exp vs Taylor-4  (E ∈ [0, 8])",
             *titles_top,
             *([""] * n_panels),
             *([""] * n_panels),
@@ -298,13 +298,11 @@ def main() -> None:
         ],
     )
 
-    # ── Row 1 (middle col only): exp vs Taylor reference, E ∈ [0, 8] ─
+    # ── Row 1 (middle col only): Exp vs Taylor-4 reference, E ∈ [0, 8] ─
     E_ref = np.linspace(0.0, 8.0, 401)
     series_ref = [
         ("exp",     arbos51.Arbos51GasPricing.exp_exact(E_ref)),
         ("taylor4", arbos51.Arbos51GasPricing.taylor4_exp(E_ref)),
-        ("taylor5", arbos51.Arbos51GasPricing.taylor5_exp(E_ref)),
-        ("taylor6", arbos51.Arbos51GasPricing.taylor6_exp(E_ref)),
     ]
     for m, y_ref in series_ref:
         color, dash, _, label = METHOD_STYLE[m]
@@ -320,7 +318,6 @@ def main() -> None:
         ), row=1, col=2)
     fig.update_yaxes(
         title_text="approx(E)",
-        type="log",
         showline=True, linewidth=1.0,
         linecolor="rgba(0,0,0,0.45)", mirror=True, ticks="outside",
         row=1, col=2,
