@@ -2635,9 +2635,9 @@ def fig_daily_spam_share() -> go.Figure:
                        "both = %{y:.1f}% of daily txs<extra></extra>",
     ))
     fig.update_layout(
-        template="plotly_white", autosize=True, height=360,
+        template="plotly_white", autosize=True, height=460,
         barmode="stack", bargap=0.0,
-        margin=dict(l=70, r=30, t=10, b=40),
+        margin=dict(l=70, r=30, t=20, b=40),
         font=dict(size=11, color="#222"),
         hovermode="x",
         legend=dict(
@@ -2776,7 +2776,7 @@ def clustering_slide_html() -> str:
     spam_stats   = _spam_summary_stats_html()
     dune_url = "https://dune.com/queries/5555110/9052858"
     spam_intro_section = (
-        '<section class="chart-stats-slide cluster-intro">'
+        '<section class="chart-stats-slide cluster-intro spam-flag-slide">'
         '  <h2>Spam wallets flag</h2>'
         '  <div class="slide-note" '
         '       style="text-align:left">'
@@ -2784,15 +2784,12 @@ def clustering_slide_html() -> str:
         f'   query on Dune: <a href="{dune_url}" target="_blank" '
         '    rel="noopener">'
         '    dune.com/queries/5555110</a>. '
-        '    We deliberately stayed with this percentile + revert '
-        '    rule approach rather than a separate clustering pass: '
-        '    it already catches the vast majority of spam wallets '
-        '    and avoids stacking another model on top.'
+        '    Percentile + revert rule, no separate clustering pass.'
         '  </div>'
         '  <div class="cluster-method">'
         '    <ol>'
         '      <li><b>Per (wallet, day)</b>: count txs and reverts.</li>'
-        '      <li><b>Top 0.01 % percentile cutoff</b> on per-wallet '
+        '      <li><b>Top 0.1 % percentile cutoff</b> on per-wallet '
         '          tx_count, recomputed each day.</li>'
         '      <li><b>Two flags per day</b>: '
         '          <code>high_vol</code> = '
@@ -2805,16 +2802,14 @@ def clustering_slide_html() -> str:
         '          <code>is_spam = (n_spam_days / n_active_days &ge; 0.5)</code>.</li>'
         '    </ol>'
         '  </div>'
-        f' {spam_snap}'
         f' {spam_stats}'
-        '  <div class="snapshot-title" '
-        '       style="text-align:center; margin: 0.6em auto 0.2em;">'
-        '    Daily share of transactions: non-spam, high-volume, '
-        '    high-revert, both'
-        '  </div>'
         f' <div class="hist-grid">{fig_div(f_spam_share, "fig-daily-spam-share")}</div>'
         '</section>'
     )
+
+    # CSS knobs to keep the spam slide one-screen: shrink methodology
+    # font + tighten paddings + lower chart height so the bar chart at
+    # the bottom isn't clipped by Reveal.js's 1080 px viewport.
     tsne_section = (
         '<section class="chart-stats-slide">'
         '  <h2>t-SNE map and K-selection diagnostics</h2>'
@@ -2880,7 +2875,12 @@ def demand_elasticity_slide_html() -> str:
 
     return (
         '<section class="chart-stats-slide capacity-intro elasticity-intro">'
-        '  <h2>Demand elasticity: cluster-based counterfactual</h2>'
+        '  <h2>Demand elasticity model on workload clusters</h2>'
+        '  <div class="wip-banner">'
+        '    🚧 <b>Work in progress.</b> This section describes the '
+        '    research direction we are exploring for the elastic-demand '
+        '    counterfactual; the figures and numbers are not finalised.'
+        '  </div>'
         '  <div class="capacity-definition">'
         '    <div class="who">Idea</div>'
         '    Use the K = 5 KMeans clusters as workload types '
@@ -3961,11 +3961,11 @@ PAGE_TEMPLATE = """<!doctype html>
 
     /* Dataframe-style snapshot tables on the cluster + spam intro slides. */
     .snapshot-row {{
-      display: flex; flex-wrap: wrap; gap: 1.2em;
-      justify-content: center; align-items: flex-start;
+      display: flex; flex-direction: column; gap: 0.6em;
+      align-items: center;
       max-width: 1300px; margin: 0.6em auto 0;
     }}
-    .snapshot-block {{ flex: 1 1 540px; min-width: 460px; }}
+    .snapshot-block {{ width: 100%; max-width: 1100px; }}
     .snapshot-block.snapshot-wide {{ flex: 1 1 1100px; }}
     .snapshot-title {{
       font-size: 0.5em; font-weight: 600; color: #444;
@@ -4091,6 +4091,33 @@ PAGE_TEMPLATE = """<!doctype html>
     .cluster-intro .cluster-method ul.cluster-method-rules li {{
       margin: 0.18em 0;
     }}
+
+    /* Spam-flag slide: compact everything so the methodology + spam-
+       wallet rollup card + daily-share bar chart all fit the 1080 px
+       viewport without the chart being clipped at the bottom. */
+    .spam-flag-slide .slide-note {{
+      padding: 0.4em 0.9em; margin: 0.25em auto;
+      font-size: 0.55em;
+    }}
+    .spam-flag-slide .cluster-method {{
+      padding: 0.5em 1.1em; margin: 0.25em auto;
+      font-size: 0.55em;
+    }}
+    .spam-flag-slide .cluster-method ol {{ margin: 0.1em 0; }}
+    .spam-flag-slide .cluster-method li {{ margin: 0.18em 0; }}
+    .spam-flag-slide .snapshot-row {{
+      margin: 0.2em auto 0;
+    }}
+    .spam-flag-slide table.snapshot-table {{
+      font-size: 0.5em;
+    }}
+    .spam-flag-slide table.snapshot-table th,
+    .spam-flag-slide table.snapshot-table td {{
+      padding: 0.22em 0.55em;
+    }}
+    .spam-flag-slide .snapshot-title {{
+      margin: 0.25em auto 0.1em !important;
+    }}
     /* Display equations inside cluster-method need a fudge factor so
        MathJax doesn't inherit the small list font size. */
     .cluster-intro .cluster-method .method-eq {{
@@ -4156,22 +4183,36 @@ PAGE_TEMPLATE = """<!doctype html>
       font-size: 1.6em !important;
       margin: 0.3em 0 !important;
     }}
-    /* Demand-elasticity slide has 3 display equations + 5 bullets, so
-       the per-eq size is dropped a notch to keep the slide on one
-       screen. */
+    /* Demand-elasticity slide: same body / equation sizing as the
+       capacity intro slide.  Reset rules from earlier attempts that
+       shrank the card. */
     .elasticity-intro .methodology {{
-      font-size: 0.55em;
+      font-size: 0.62em;
     }}
-    .elasticity-intro .methodology li {{ margin: 0.3em 0; }}
+    .elasticity-intro .methodology li {{ margin: 0.45em 0; }}
+    .elasticity-intro .methodology .method-eq {{
+      margin: 0.4em 0 0.3em;
+      text-align: center;
+    }}
     .elasticity-intro .methodology .method-eq mjx-container[display="true"] {{
-      font-size: 1.15em !important;
-      margin: 0.15em 0 !important;
+      font-size: 1.5em !important;
+      margin: 0.2em 0 !important;
     }}
     .elasticity-intro .capacity-definition {{
-      font-size: 0.55em;
-      padding: 0.55em 1em;
+      font-size: 0.62em;
+      padding: 0.7em 1.1em;
       margin: 0.3em auto 0.5em;
     }}
+    /* Under-construction banner on the demand-elasticity slide. */
+    .elasticity-intro .wip-banner {{
+      max-width: 1100px; margin: 0.4em auto;
+      padding: 0.55em 1em;
+      font-size: 0.62em; color: #6a4f00; line-height: 1.5;
+      background: rgba(251, 192, 45, 0.18);
+      border-left: 3px solid #fbc02d;
+      border-radius: 3px;
+    }}
+    .elasticity-intro .wip-banner b {{ color: #6a4f00; }}
 
     /* Short data + interpretation note above/below figures. */
     .slide-note {{
