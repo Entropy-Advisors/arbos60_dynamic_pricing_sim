@@ -3357,11 +3357,13 @@ def tx_resource_stats_html(hist: dict) -> str:
     n = n_grand_total
 
     def fmt(v: float) -> str:
+        """2-decimal float for every cell, with K/M scaling so the table
+        stays compact (e.g. 1234.5 → '1.23K', 1234567 → '1.23M')."""
         if v >= 1_000_000:
-            return f"{v/1e6:,.2f}M"
+            return f"{v/1e6:.2f}M"
         if v >= 1_000:
-            return f"{v/1e3:,.1f}K"
-        return f"{v:,.0f}"
+            return f"{v/1e3:.2f}K"
+        return f"{v:.2f}"
 
     def cell(v: float, extra: str = "") -> str:
         """Format a numeric cell.  Zero values get a `zero` class so the
@@ -3409,7 +3411,7 @@ def tx_resource_stats_html(hist: dict) -> str:
             f'{cell(r["p25_all"])}'
             f'{cell(r["p75_all"])}'
             f'{cell(r["p99_all"])}'
-            f'<td class="num">{r["pct_zero_all"]:.1f}%</td>'
+            f'<td class="num">{r["pct_zero_all"]:.2f}%</td>'
             f'</tr>'
         )
     table = (
